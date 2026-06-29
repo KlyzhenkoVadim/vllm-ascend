@@ -1453,11 +1453,11 @@ class AscendDSAImpl(DSAAttentionImpl):
         # indexer param
         if self.indexer is not None:
             self.indexer_heads: int = self.indexer.n_heads
-            self.inderxer_dim: int = self.indexer.head_dim
+            self.indexer_dim: int = self.indexer.head_dim
             self.inderxer_wq_b = self.indexer.wq_b
             self.cv_inderxer_wq_b = CVLinearWrapper(self.inderxer_wq_b)
             self.weights_proj = self.indexer.weights_proj
-            self.indexer_softmax_scale = self.inderxer_dim**-0.5
+            self.indexer_softmax_scale = self.indexer_dim**-0.5
 
             self.indexer_compress = self.indexer.compressor
 
@@ -2564,8 +2564,8 @@ class AscendDSAImpl(DSAAttentionImpl):
                 self.ustep=0
                 self.start_topm_cache=True
 
-            if False:
-            # if self.start_topm_cache:
+            # if False:
+            if self.start_topm_cache:
                 if self.ustep % self.micro_step_num == 0:
                     self.topM_idxs, _ = torch.ops._C_ascend.npu_vllm_quant_lightning_indexer(
                     query=q,
@@ -2897,9 +2897,9 @@ class AscendDSAImpl(DSAAttentionImpl):
         topm_qli_metadata = torch.ops._C_ascend.npu_vllm_quant_lightning_indexer_metadata(
             actual_seq_lengths_query=qlens,
             actual_seq_lengths_key=topm_kvlens,
-            num_heads_q=self.num_heads,
+            num_heads_q=self.indexer_heads,  # 64
             num_heads_k=1,
-            head_dim=self.head_dim,
+            head_dim=self.indexer_dim, # 128
             query_quant_mode=0,
             key_quant_mode=0,
             batch_size=1,
