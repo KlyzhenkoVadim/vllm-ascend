@@ -2520,15 +2520,6 @@ class AscendDSAImpl(DSAAttentionImpl):
         indexer_kv_scale_metadata,
         with_prefill: bool,
     ):
-        # prompt.len > 2048
-        # [0 ... 2047]
-        # [0 ... 511] <- compressed tokens
-        # compress_ratio = 128, compress_ratio =4 
-        # seq_len // m % topM == 0 => full KV , is_decode is_prefill ?
-        # topM <= 2048
-        #TODO(KlyzhenkoVadim): Change.
-        #FIXME: This prototype for one-request only.
-        # self.index_topk = 2
         if with_prefill:
             assert indexer_kv_scale_metadata.prefill is not None
             qlens = indexer_kv_scale_metadata.prefill.query_start_loc[1:]
@@ -2537,7 +2528,7 @@ class AscendDSAImpl(DSAAttentionImpl):
             qli_metadata = indexer_kv_scale_metadata.prefill.qli_metadata
             topk_idxs, _ = torch.ops._C_ascend.npu_vllm_quant_lightning_indexer(
                 query=q,
-                key=indexer_k_cache, # (num_slots, block_size, 1(?), 128)
+                key=indexer_k_cache, # (num_slots, block_size, 1(?), head_dim(128))
                 weights=DeviceOperator.prepare_dsa_indexer_weights(weights),
                 query_dequant_scale=DeviceOperator.prepare_dsa_indexer_query_scale(q_scale),
                 key_dequant_scale=DeviceOperator.prepare_dsa_indexer_key_scale(indexer_scale_cache),
@@ -2559,6 +2550,7 @@ class AscendDSAImpl(DSAAttentionImpl):
         else:
             assert indexer_kv_scale_metadata.decode is not None
             qlens = indexer_kv_scale_metadata.decode.query_start_loc[1:]
+            q_actual_length = qlens - indexer_kv_scale_metadata.decode.query_start_loc[:-1]
             kvlens = indexer_kv_scale_metadata.decode.seq_lens
             block_table = indexer_kv_scale_metadata.decode.block_table
             qli_metadata = indexer_kv_scale_metadata.decode.qli_metadata
@@ -2581,19 +2573,42 @@ class AscendDSAImpl(DSAAttentionImpl):
                 default_state[:B][crossed] = False
                 compute_topm_state[:B][crossed] = True
 
-            topk_idxs = torch.zeros(B, 1, self.index_topk, dtype=torch.int32, device=q.device).fill_(-1)
+
+            topk_idxs = torch.zeros(B, 1, self.index_topk, dtype=torch.int32, device=q.device).fill_(-1) #TODO(KlyzhenkoVadim): fill_(-1)!!!
             if default_state.any():
+                # Recompute qli_metadata
+                default_qlens = self._remap_qlens(qlens, default_state)
+                default_qli_metadata = torch.ops._C_ascend.npu_vllm_quant_lightning_indexer_metadata(
+                    actual_seq_lengths_query=default_qlens,
+                    actual_seq_lengths_key=kvlens[default_state],
+                    num_heads_q=self.indexer_heads,  # 64
+                    num_heads_k=1,
+                    head_dim=self.indexer_dim, # 128
+                    query_quant_mode=0,
+                    key_quant_mode=0,
+                    batch_size=default_qlens.shape[0],
+                    max_seqlen_q=default_qlens.max().item(),
+                    max_seqlen_k=kvlens[default_state].max().item(),
+                    layout_query="TND",
+                    layout_key="PA_BSND",
+                    sparse_count=self.index_topk,
+                    sparse_mode=3,
+                    pre_tokens=(1 << 63) - 1,
+                    next_tokens=(1 << 63) - 1,
+                    cmp_ratio=4,
+                    device=str(qlens.device),
+                )
                 topk_idxs[default_state], _ = torch.ops._C_ascend.npu_vllm_quant_lightning_indexer(
                     query=q[default_state],
-                    key=indexer_k_cache, # (num_slots, block_size, 1(?), 128)
-                    weights=DeviceOperator.prepare_dsa_indexer_weights(weights),
-                    query_dequant_scale=DeviceOperator.prepare_dsa_indexer_query_scale(q_scale),
+                    key=indexer_k_cache, # (num_slots, block_size, 1(?), head_dim(128))
+                    weights=DeviceOperator.prepare_dsa_indexer_weights(weights[default_state]),
+                    query_dequant_scale=DeviceOperator.prepare_dsa_indexer_query_scale(q_scale[default_state]),
                     key_dequant_scale=DeviceOperator.prepare_dsa_indexer_key_scale(indexer_scale_cache),
-                    actual_seq_lengths_query=qlens[default_state], # TODO: We need to change logic
+                    actual_seq_lengths_query=self._remap_qlens(qlens, default_state), # TODO: We need to change logic
                     #because we need to change cumsum or smth...
-                    actual_seq_lengths_key=kvlens[default_state],
+                    actual_seq_lengths_key=kvlens[default_state], # TODO: Have a check whether we need  kvlens[default_state]
                     block_table=block_table[default_state],
-                    metadata=qli_metadata,#TODO: Seems like we need to recompute for sub-batch
+                    metadata=default_qli_metadata, #qli_metadata,#TODO: Seems like we need to recompute for sub-batch
                     query_quant_mode=0,
                     key_quant_mode=0,
                     layout_query="TND",
@@ -2607,16 +2622,39 @@ class AscendDSAImpl(DSAAttentionImpl):
                 ) # topk_idsx < 512
 
             if compute_topm_state.any():
+                # Recompute qli_metadata
+                compute_topm_qlens = self._remap_qlens(qlens, compute_topm_state)
+                compute_topm_kvlens = kvlens[compute_topm_state]
+                compute_topm_qli_metadata = torch.ops._C_ascend.npu_vllm_quant_lightning_indexer_metadata(
+                    actual_seq_lengths_query=compute_topm_qlens,
+                    actual_seq_lengths_key=compute_topm_kvlens,
+                    num_heads_q=self.indexer_heads,  # 64
+                    num_heads_k=1,
+                    head_dim=self.indexer_dim, # 128
+                    query_quant_mode=0,
+                    key_quant_mode=0,
+                    batch_size=compute_topm_qlens.shape[0],
+                    max_seqlen_q=compute_topm_qlens.max().item(),
+                    max_seqlen_k=compute_topm_kvlens.max().item(),
+                    layout_query="TND",
+                    layout_key="PA_BSND",
+                    sparse_count=self.index_topk,
+                    sparse_mode=3,
+                    pre_tokens=(1 << 63) - 1,
+                    next_tokens=(1 << 63) - 1,
+                    cmp_ratio=4,
+                    device=str(qlens.device),
+                )
                 self.topm_idxs[:B][compute_topm_state], _ = torch.ops._C_ascend.npu_vllm_quant_lightning_indexer(
                 query=q[compute_topm_state],
-                key=indexer_k_cache, # (num_slots, block_size, 1(?), 128)
-                weights=DeviceOperator.prepare_dsa_indexer_weights(weights),
-                query_dequant_scale=DeviceOperator.prepare_dsa_indexer_query_scale(q_scale),
+                key=indexer_k_cache, # (num_slots, block_size, 1(?), head_dim(128))
+                weights=DeviceOperator.prepare_dsa_indexer_weights(weights[compute_topm_state]),
+                query_dequant_scale=DeviceOperator.prepare_dsa_indexer_query_scale(q_scale[compute_topm_state]),
                 key_dequant_scale=DeviceOperator.prepare_dsa_indexer_key_scale(indexer_scale_cache),
-                actual_seq_lengths_query=qlens[compute_topm_state],
-                actual_seq_lengths_key=kvlens[compute_topm_state],
+                actual_seq_lengths_query=compute_topm_qlens, #qlens[compute_topm_state], #TODO(KlyzhenkoVadim): Test it!
+                actual_seq_lengths_key=compute_topm_kvlens,
                 block_table=block_table[compute_topm_state],
-                metadata=qli_metadata, #TODO(KlyzhenkoVadim): Seems like we need to recompute for sub-batch
+                metadata=compute_topm_qli_metadata, #qli_metadata, #TODO(KlyzhenkoVadim): Seems like we need to recompute for sub-batch
                 query_quant_mode=0,
                 key_quant_mode=0,
                 layout_query="TND",
@@ -2633,6 +2671,7 @@ class AscendDSAImpl(DSAAttentionImpl):
                 # self.topM_idxs = torch.tensor([[[5,3,4,2]]], dtype=topk_idxs.dtype, device=topk_idxs.device)
                 self.ustep[:B][compute_topm_state] += 1
             if reuse_topm_state.any():
+                reuse_topm_qlens = self._remap_qlens(qlens, reuse_topm_state)
                 (topm_indexer_k_cache, 
                     topm_indexer_scale_cache, 
                     topm_kvlens, 
@@ -2642,20 +2681,20 @@ class AscendDSAImpl(DSAAttentionImpl):
                     indexer_scale_cache, 
                     kvlens[reuse_topm_state], 
                     block_table[reuse_topm_state],
-                    qlens[reuse_topm_state], #TODO(KlyzhenkoVadim): Change the logic for qlens. Because we need to change cumsum or smth...
+                    reuse_topm_qlens, #qlens[reuse_topm_state], #TODO(KlyzhenkoVadim): Change the logic for qlens. Because we need to change cumsum or smth...
                     self.topm_idxs[:B][reuse_topm_state].squeeze(1),
                 )
                 local_topk_idxs, _ = torch.ops._C_ascend.npu_vllm_quant_lightning_indexer(
                     query=q[reuse_topm_state],
                     key=topm_indexer_k_cache, # (n, block_size(32), 1, head_dim(128))
-                    weights=DeviceOperator.prepare_dsa_indexer_weights(weights),
-                    query_dequant_scale=DeviceOperator.prepare_dsa_indexer_query_scale(q_scale),
+                    weights=DeviceOperator.prepare_dsa_indexer_weights(weights[reuse_topm_state]),
+                    query_dequant_scale=DeviceOperator.prepare_dsa_indexer_query_scale(q_scale[reuse_topm_state]),
                     key_dequant_scale=DeviceOperator.prepare_dsa_indexer_key_scale(topm_indexer_scale_cache),
                     #[0,9,20,30] req_1(0,...9), req_2(10,...19), req_3(20,29) | reuse_topm_state=[True,False,True] ---> qlens[0,9,19]
-                    actual_seq_lengths_query=qlens[reuse_topm_state], # TODO: We need to change logic because we need to change cumsum or smth...
+                    actual_seq_lengths_query=reuse_topm_qlens, #qlens[reuse_topm_state], # TODO: We need to change logic because we need to change cumsum or smth...
                     actual_seq_lengths_key=topm_kvlens,
-                    block_table=topm_block_table, #TODO: CHANGECHANGE [1,0.....0] (1, max_model_len / max_num_request)
-                    metadata=topm_qli_metadata, # qli = q(uant)l(ightning)i(ndexer) # [1,0,....0] (,1024)
+                    block_table=topm_block_table,
+                    metadata=topm_qli_metadata, # [1,0,....0] (,1024)
                     query_quant_mode=0,
                     key_quant_mode=0,
                     layout_query="TND",
@@ -2672,6 +2711,7 @@ class AscendDSAImpl(DSAAttentionImpl):
                 self.ustep[:B][reuse_topm_state]+=1
             #NOTE: But finally we need to gather topk_idxs form each state!
         return topk_idxs
+
 
     def indexer_select_qli(
         self,
@@ -2866,15 +2906,17 @@ class AscendDSAImpl(DSAAttentionImpl):
 
         return q
 
-    def _prepare_k_cache_for_qli(self,
-                                 indexer_k_cache, # (num_slots, block_size(32), 1, head_dim(128))
-                                 indexer_scale_cache, # (num_slots, block_size(32), 1, 1)
-                                 kvlens, # (B,)
-                                 block_table, # (B, num_block_per_req)
-                                 qlens, # (B+1,)
-                                 topm_idxs # (B, index_topm)
-                                 ):
-        """ Let's B=2, topm_idxs[[0,15,32,48],[0,10,33,60]].
+    def _prepare_k_cache_for_qli(
+        self,
+        indexer_k_cache, # (num_slots, block_size(32), 1, head_dim(128))
+        indexer_scale_cache, # (num_slots, block_size(32), 1, 1)
+        kvlens, # (B,)
+        block_table, # (B, num_block_per_req)
+        qlens, # (B+1,)
+        topm_idxs # (B, index_topm)
+    ):
+        """
+        Let's B=2, topm_idxs[[0,15,32,48],[0,10,33,60]].
         Then logical_block_ids=[[0,0,1,1],[0,0,1,1]]. block_table=[[1,3,....],[16,18,...]].
         Then physical_block_ids=[[1,1,3,3],[16,16,18,18]]
         offsets=[[0,15,0,16],[0,10,1,28]]
@@ -2888,13 +2930,11 @@ class AscendDSAImpl(DSAAttentionImpl):
         physical_block_idx = torch.gather(block_table, 1, logical_block_ids) # (B,topm)
         topm_indexer_k_cache = indexer_k_cache[physical_block_idx, offsets] # (B, topm, 1, head_dim(128))
         topm_indexer_scale_cache = indexer_scale_cache[physical_block_idx, offsets] # (B, topm, 1, 1)
-        #!!!!!!!!!!!!!!!!!!!
-        # TODO: Have a check we choose correct vectors.
+
         num_blocks_per_request = cdiv(self.index_topm, block_size)
         num_blocks = B * num_blocks_per_request
-        new_k = torch.zeros(num_blocks,block_size, 1, 128, dtype=indexer_k_cache.dtype, device=indexer_k_cache.device)
+        new_k = torch.zeros(num_blocks,block_size, 1, self.indexer_dim, dtype=indexer_k_cache.dtype, device=indexer_k_cache.device)
         new_scale = torch.zeros(num_blocks, block_size, 1, 1, dtype=indexer_scale_cache.dtype, device=indexer_scale_cache.device)
-        # TODO(HAVE A CHECK!!!!)
         for i in range(B):
             k_i = topm_indexer_k_cache[i]
             scale_i = topm_indexer_scale_cache[i]
@@ -2908,7 +2948,7 @@ class AscendDSAImpl(DSAAttentionImpl):
         new_k = new_k.contiguous()
         new_scale = new_scale.contiguous()
 
-        topm_kvlens = torch.empty_like(kvlens).fill_(self.index_topm * 4) # * compress_ratio
+        topm_kvlens = torch.empty_like(kvlens).fill_(self.index_topm * self.compress_ratio)
         topm_block_table = torch.arange(num_blocks, device=block_table.device).view(B, num_blocks_per_request).to(torch.int32)
         
         # Recompute qli_metadata
@@ -2931,6 +2971,22 @@ class AscendDSAImpl(DSAAttentionImpl):
             next_tokens=(1 << 63) - 1,
             cmp_ratio=4,
             device=str(new_k.device),
-    )
+        )
         
         return (new_k, new_scale, topm_kvlens, topm_block_table, topm_qli_metadata)
+
+    def _remap_qlens(self, orig_qlens, mask):
+        """
+        orig_qlens: [B] – префиксная сумма (например, query_start_loc[1:])
+        mask: [B] – булева маска активных запросов
+        Возвращает:
+            new_qlens: [num_active + 1] – новый query_start_loc с нулём в начале
+        """
+        # Вытаскиваем длины каждого запроса из префиксной суммы
+        lengths = orig_qlens.clone()
+        lengths[1:] = orig_qlens[1:] - orig_qlens[:-1]  # [len1, len2, ..., lenB]
+        active_lengths = lengths[mask]                   # [num_active]
+
+        # Строим новый query_start_loc: [0, len1, len1+len2, ...]
+        new_qlens = torch.cumsum(active_lengths, dim=0, dtype=torch.int32)
+        return new_qlens
