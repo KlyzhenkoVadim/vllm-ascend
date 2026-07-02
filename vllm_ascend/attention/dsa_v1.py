@@ -1495,14 +1495,12 @@ class AscendDSAImpl(DSAAttentionImpl):
         )
 
         # topM
-        # self.ustep=0
-        # self.start_topm_cache=False
-        # self.index_topm = 1024 # 4
-        # self.micro_step_num = 4
+        self.index_topm = 550 #getattr(self.vllm_config.model_config.hf_config, "index_topm", 0)
+        self.micro_step_num = 4
         max_batch = self.vllm_config.scheduler_config.max_num_seqs
-        self.ustep = torch.zeros(max_batch, dtype=torch.int32, device='cpu')
-        self.start_topm_cache = torch.zeros(max_batch, dtype=torch.bool, device='cpu')
-        self.topM_idxs = torch.zeros(max_batch, 1, self.index_topm, dtype=torch.int32, device=device)
+        self.ustep = torch.zeros(max_batch, dtype=torch.int32, device=self.wo_a.weight.device)
+        self.start_topm_cache = torch.zeros(max_batch, dtype=torch.bool, device=self.wo_a.weight.device)
+        self.topm_idxs = torch.zeros(max_batch, 1, self.index_topm, dtype=torch.int32, device=self.wo_a.weight.device)
 
     def _get_indexcache_topk_indices(self, num_tokens: int, offset: int = 0) -> torch.Tensor:
         if self.topk_indices_buffer is None:
