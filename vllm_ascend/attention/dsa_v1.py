@@ -2976,13 +2976,13 @@ class AscendDSAImpl(DSAAttentionImpl):
         orig_qlens: [B] – префиксная сумма (например, query_start_loc[1:])
         mask: [B] – булева маска активных запросов
         Возвращает:
-            new_qlens: [num_active + 1] – новый query_start_loc с нулём в начале
+            new_qlens: [num_active + 1] – новый query length
         """
         # Вытаскиваем длины каждого запроса из префиксной суммы
         lengths = orig_qlens.clone()
         lengths[1:] = orig_qlens[1:] - orig_qlens[:-1]  # [len1, len2, ..., lenB]
         active_lengths = lengths[mask]                   # [num_active]
 
-        # Строим новый query_start_loc: [0, len1, len1+len2, ...]
+        # Строим новый query_start_loc: [len1, len1+len2, ...]
         new_qlens = torch.cumsum(active_lengths, dim=0, dtype=torch.int32)
         return new_qlens
