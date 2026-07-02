@@ -2550,7 +2550,6 @@ class AscendDSAImpl(DSAAttentionImpl):
         else:
             assert indexer_kv_scale_metadata.decode is not None
             qlens = indexer_kv_scale_metadata.decode.query_start_loc[1:]
-            q_actual_length = qlens - indexer_kv_scale_metadata.decode.query_start_loc[:-1]
             kvlens = indexer_kv_scale_metadata.decode.seq_lens
             block_table = indexer_kv_scale_metadata.decode.block_table
             qli_metadata = indexer_kv_scale_metadata.decode.qli_metadata
@@ -2574,7 +2573,7 @@ class AscendDSAImpl(DSAAttentionImpl):
                 compute_topm_state[:B][crossed] = True
 
 
-            topk_idxs = torch.zeros(B, 1, self.index_topk, dtype=torch.int32, device=q.device).fill_(-1) #TODO(KlyzhenkoVadim): fill_(-1)!!!
+            topk_idxs = torch.zeros(B, 1, self.index_topk, dtype=torch.int32, device=q.device).fill_(-1)
             if default_state.any():
                 # Recompute qli_metadata
                 default_qlens = self._remap_qlens(qlens, default_state)
@@ -2608,7 +2607,7 @@ class AscendDSAImpl(DSAAttentionImpl):
                     #because we need to change cumsum or smth...
                     actual_seq_lengths_key=kvlens[default_state], # TODO: Have a check whether we need  kvlens[default_state]
                     block_table=block_table[default_state],
-                    metadata=default_qli_metadata, #qli_metadata,#TODO: Seems like we need to recompute for sub-batch
+                    metadata=default_qli_metadata,
                     query_quant_mode=0,
                     key_quant_mode=0,
                     layout_query="TND",
@@ -2654,7 +2653,7 @@ class AscendDSAImpl(DSAAttentionImpl):
                 actual_seq_lengths_query=compute_topm_qlens, #qlens[compute_topm_state], #TODO(KlyzhenkoVadim): Test it!
                 actual_seq_lengths_key=compute_topm_kvlens,
                 block_table=block_table[compute_topm_state],
-                metadata=compute_topm_qli_metadata, #qli_metadata, #TODO(KlyzhenkoVadim): Seems like we need to recompute for sub-batch
+                metadata=compute_topm_qli_metadata,
                 query_quant_mode=0,
                 key_quant_mode=0,
                 layout_query="TND",
@@ -2681,7 +2680,7 @@ class AscendDSAImpl(DSAAttentionImpl):
                     indexer_scale_cache, 
                     kvlens[reuse_topm_state], 
                     block_table[reuse_topm_state],
-                    reuse_topm_qlens, #qlens[reuse_topm_state], #TODO(KlyzhenkoVadim): Change the logic for qlens. Because we need to change cumsum or smth...
+                    reuse_topm_qlens,
                     self.topm_idxs[:B][reuse_topm_state].squeeze(1),
                 )
                 local_topk_idxs, _ = torch.ops._C_ascend.npu_vllm_quant_lightning_indexer(
@@ -2691,7 +2690,7 @@ class AscendDSAImpl(DSAAttentionImpl):
                     query_dequant_scale=DeviceOperator.prepare_dsa_indexer_query_scale(q_scale[reuse_topm_state]),
                     key_dequant_scale=DeviceOperator.prepare_dsa_indexer_key_scale(topm_indexer_scale_cache),
                     #[0,9,20,30] req_1(0,...9), req_2(10,...19), req_3(20,29) | reuse_topm_state=[True,False,True] ---> qlens[0,9,19]
-                    actual_seq_lengths_query=reuse_topm_qlens, #qlens[reuse_topm_state], # TODO: We need to change logic because we need to change cumsum or smth...
+                    actual_seq_lengths_query=reuse_topm_qlens,
                     actual_seq_lengths_key=topm_kvlens,
                     block_table=topm_block_table,
                     metadata=topm_qli_metadata, # [1,0,....0] (,1024)
@@ -2709,7 +2708,6 @@ class AscendDSAImpl(DSAAttentionImpl):
                 #NOTE: this is mapping of indices.
                 topk_idxs[reuse_topm_state] = torch.gather(self.topm_idxs[:B][reuse_topm_state], dim=2, index=local_topk_idxs.long())
                 self.ustep[:B][reuse_topm_state]+=1
-            #NOTE: But finally we need to gather topk_idxs form each state!
         return topk_idxs
 
 
