@@ -17,6 +17,9 @@
 # Adapted from vllm-project/vllm/vllm/worker/gpu_input_batch.py
 #
 
+from dataclasses import dataclass
+from typing import Optional
+
 import numpy as np
 import torch
 from vllm.lora.request import LoRARequest
@@ -25,9 +28,16 @@ from vllm.v1.kv_cache_interface import KVCacheGroupSpec
 from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.pool.metadata import PoolingStates
 from vllm.v1.sample.logits_processor import BatchUpdateBuilder, LogitsProcessors
-from vllm.v1.worker.gpu_input_batch import InputBatch
+from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
 from vllm_ascend.worker.block_table import MultiGroupBlockTable
+
+
+@dataclass
+class TopMReqState:
+    ustep: int = 0
+    start_cache: bool = False
+    topm_idxs: Optional[torch.Tensor] = None
 
 
 class NPUInputBatch(InputBatch):
@@ -219,6 +229,10 @@ class NPUInputBatch(InputBatch):
         self.logitsprocs = logitsprocs or LogitsProcessors()
         self.logitsprocs_need_output_token_ids = logitsprocs_need_output_token_ids
 
+        # Per-request per-layer topM state (ustep, start_cache, topm_idxs).
+        # Keyed by req_id -> layer_name -> TopMReqState.
+        self.topm_state: dict[str, dict[str, TopMReqState]] = {}
+
         # Store last speculative tokens for sampler.
         self.spec_token_ids: list[list[int]] = [[] for _ in range(max_num_reqs)]
 
@@ -237,3 +251,13 @@ class NPUInputBatch(InputBatch):
         # (e.g. penalties).
         self.sampled_token_ids_cpu: torch.Tensor | None = None
         self.async_copy_ready_event: torch.Event | None = None
+
+    def add_request(self, request: CachedRequestState) -> int:
+        req_index = super().add_request(request)
+        self.topm_state.setdefault(request.req_id, {})
+        return req_index
+
+    def remove_request(self, req_id: str) -> int | None:
+        req_index = super().remove_request(req_id)
+        self.topm_state.pop(req_id, None)
+        return req_index

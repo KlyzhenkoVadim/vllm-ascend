@@ -286,7 +286,7 @@ class AscendDSADecodeMetadata:
     # TopM reusing metadata
     # TODO(KlyzhenkoVadim): Make sure whether we need this
     # in attn_metadata, maybe it's data for current batch.
-    topm_state_mask: torch.Tensor = None # [B] int: 0=default, 1=compute, 2=reuse
+    topm_start_cache: torch.Tensor = None # [B] bool - whether caching started for each req
     topm_idxs: torch.Tensor = None # [B,M] int32 - topm indices for each req in current batch
     topm_ustep: torch.Tensor = None # [B] int32 - micro step for each req in current batch
     # # ... существующие поля ...
@@ -612,7 +612,12 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         decode_metadata = None
 
         if self.num_decodes > 0:
-            decode_metadata = self.build_decode_metadata(common_prefix_len, common_attn_metadata, num_reqs_actual)
+            decode_metadata = self.build_decode_metadata(
+                common_prefix_len, common_attn_metadata, num_reqs_actual,
+                input_batch=kwargs.get("input_batch"),
+                index_topm=kwargs.get("index_topm", 550),
+                micro_step_num=kwargs.get("micro_step_num", 4),
+            )
 
         return self.metadata_cls(  # type: ignore
             num_input_tokens=common_attn_metadata.num_input_tokens,
@@ -898,6 +903,9 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         common_prefix_len: int,
         common_attn_metadata: AscendCommonAttentionMetadata,
         num_reqs_actual: int | None,
+        input_batch: Optional["NPUInputBatch"] = None,
+        index_topm: int = 550,
+        micro_step_num: int = 4,
     ) -> AscendDSADecodeMetadata:
         assert self.decode_ratio_to_sas_metadata is not None
         if self.decode_ratio_to_sas_metadata.get("query_start_loc", None) is None:
@@ -1014,6 +1022,29 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         tp_size = get_tensor_model_parallel_world_size()
         n_local_heads = self.model_config.hf_config.num_attention_heads // tp_size
         index_topk = self.model_config.hf_config.index_topk
+        index_topm = getattr(self.model_config.hf_config, "index_topm", index_topm)
+
+        # --- topM temp buffers: filled from input_batch.topm_state ---
+        topm_ustep = None
+        topm_start_cache = None
+        topm_idxs = None
+        if input_batch is not None and self.num_decodes > 0:
+            B = self.num_decodes
+            device = self.seqused_q.device
+            topm_ustep = torch.zeros(B, dtype=torch.int32, device=device)
+            topm_start_cache = torch.zeros(B, dtype=torch.bool, device=device)
+            topm_idxs = torch.zeros(B, 1, index_topm, dtype=torch.int32, device=device)
+            layer_name = f"c{self.compressor_ratio}"
+            req_ids = input_batch.req_ids[:B]
+            for i, rid in enumerate(req_ids):
+                if rid is None:
+                    continue
+                layer_state = input_batch.topm_state.get(rid, {}).get(layer_name)
+                if layer_state is not None:
+                    topm_ustep[i] = layer_state.ustep
+                    topm_start_cache[i] = layer_state.start_cache
+                    if layer_state.topm_idxs is not None:
+                        topm_idxs[i] = layer_state.topm_idxs
 
         assert self.decode_sas_metadata is not None
 
@@ -1028,6 +1059,9 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         metadata_op = DeviceOperator.get_dsa_sparse_attn_metadata_op()
         metadata_kwargs = DeviceOperator.get_dsa_sparse_attn_metadata_kwargs(self.seqused_q.device)
         cu_seqlens_cmp_kv = DeviceOperator.get_dsa_decode_cu_seqlens_cmp_kv(self.cu_seqlens_cmp_kv)
+        default_metadata = None
+        compute_topm_metadata = None
+        reuse_topm_metadata = None
         if self.compressor_ratio <= 1:
             if self.decode_ratio_to_sas_metadata.get(layer_name) is None:
                 self.decode_ratio_to_sas_metadata[layer_name] = metadata_op(
@@ -1082,19 +1116,17 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                     has_cmp_kv=True,
                 )
             self.decode_sas_metadata[:1024] = self.decode_ratio_to_sas_metadata[layer_name]
-            #TODO(KLyzhenkoVadim): Maybe here we need to add our main logic.
-            #self.use_topm_caching=True
-            if True:
+            if topm_ustep is not None:
                 default_metadata, compute_topm_metadata, reuse_topm_metadata = self._build_topm_subgroups(
                     qlens=query_start_loc[1:],
                     kvlens=self.seq_lens,
                     block_table=self.block_table[:block_table_size, ...],
-                    start_topm_cache=...,
-                    ustep=...,
-                    topm_idxs=...,
-                    index_topm=...,
-                    micro_step_num=...,
-                    index_topk=...,
+                    start_topm_cache=topm_start_cache,
+                    ustep=topm_ustep,
+                    topm_idxs=topm_idxs,
+                    index_topm=index_topm,
+                    micro_step_num=micro_step_num,
+                    index_topk=index_topk,
                 )
         else:
             if self.decode_ratio_to_sas_metadata.get(layer_name) is None:
@@ -1166,6 +1198,12 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             start_pos=self.start_pos_decode[: self.num_decodes],  # cached
             sas_metadata=self.decode_sas_metadata,
             qli_metadata=self.decode_qli_metadata,
+            topm_ustep=topm_ustep,
+            topm_start_cache=topm_start_cache,
+            topm_idxs=topm_idxs,
+            default_metadata=default_metadata if topm_ustep is not None else None,
+            compute_topm_metadata=compute_topm_metadata if topm_ustep is not None else None,
+            reuse_topm_metadata=reuse_topm_metadata if topm_ustep is not None else None,
         )
         return decode_metadata
 
@@ -1450,9 +1488,9 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             new_qli_metadata = torch.ops._C_ascend.npu_vllm_quant_lightning_indexer_metadata(
                 actual_seq_lengths_query=new_qlens,
                 actual_seq_lengths_key=new_kvlens,
-                num_heads_q=self.indexer_heads, #TODO(KlyzhenkoVadim): Find which indexer_heads should we use here!  # 64
+                num_heads_q=self.model_config.hf_config.index_n_heads,  # 64
                 num_heads_k=1,
-                head_dim=self.indexer_dim, #TODO(KlyzhenkoVadim): Find which indexer_dim should we use here! # 128
+                head_dim=self.model_config.hf_config.index_head_dim,  # 128
                 query_quant_mode=0,
                 key_quant_mode=0,
                 batch_size=new_qlens.shape[0],
@@ -1460,7 +1498,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 max_seqlen_k=new_kvlens.max().item(),
                 layout_query="TND",
                 layout_key="PA_BSND",
-                sparse_count=self.index_topk, #TODO(KlyzhenkoVadim): Find which way to change!
+                sparse_count=index_topk,
                 sparse_mode=3,
                 pre_tokens=(1 << 63) - 1,
                 next_tokens=(1 << 63) - 1,
@@ -1486,9 +1524,9 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             new_qli_metadata = torch.ops._C_ascend.npu_vllm_quant_lightning_indexer_metadata(
                 actual_seq_lengths_query=new_qlens,
                 actual_seq_lengths_key=new_kvlens,
-                num_heads_q=self.indexer_heads, #TODO(KlyzhenkoVadim): Find which indexer_heads should we use here!  # 64
+                num_heads_q=self.model_config.hf_config.index_n_heads,  # 64
                 num_heads_k=1,
-                head_dim=self.indexer_dim, #TODO(KlyzhenkoVadim): Find which indexer_dim should we use here! # 128
+                head_dim=self.model_config.hf_config.index_head_dim,  # 128
                 query_quant_mode=0,
                 key_quant_mode=0,
                 batch_size=new_qlens.shape[0],
@@ -1496,7 +1534,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 max_seqlen_k=new_kvlens.max().item(),
                 layout_query="TND",
                 layout_key="PA_BSND",
-                sparse_count=self.index_topm, #TODO(KlyzhenkoVadim): Find which way to change!
+                sparse_count=index_topm,
                 sparse_mode=3,
                 pre_tokens=(1 << 63) - 1,
                 next_tokens=(1 << 63) - 1,
@@ -1514,24 +1552,16 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 block_table=new_block_table,
                 qli_metadata=new_qli_metadata,
             )
-        #TODO(KlyzhenkoVadim): Finish it, because it's quite difficult.
         if reuse_mask.any():
             topm_qlens = self._remap_qlens(qlens, reuse_mask)
-            topm_kvlens = torch.empty_like(kvlens).fill_(self.index_topm * self.compress_ratio)
-            #TODO(KlyzhenkoVadim): Adapt it to the builder! From where should we get topm_idxs???
-            # B = topm_idxs.shape[0] # num_reqs
-            # block_size = indexer_k_cache.shape[1] #TODO(KlyzhenkoVadim): This is unacceptable. Should be changed. # block_size=32
-            # num_blocks_per_request = cdiv(self.index_topm, block_size)
-            # num_blocks = B * num_blocks_per_request
-            # topm_block_table = torch.arange(num_blocks, device=block_table.device).view(B, num_blocks_per_request).to(torch.int32)
-            topm_block_table = block_table[reuse_mask] # NOTE: Currently let's leave this variant. Becuase block_table is needed for phys block.
-            # Recompute qli_metadata
+            topm_kvlens = torch.empty_like(kvlens).fill_(index_topm * self.compressor_ratio)
+            topm_block_table = block_table[reuse_mask]
             topm_qli_metadata = torch.ops._C_ascend.npu_vllm_quant_lightning_indexer_metadata(
                 actual_seq_lengths_query=topm_qlens,
                 actual_seq_lengths_key=topm_kvlens,
-                num_heads_q=self.indexer_heads,  # 64
+                num_heads_q=self.model_config.hf_config.index_n_heads,  # 64
                 num_heads_k=1,
-                head_dim=self.indexer_dim, # 128
+                head_dim=self.model_config.hf_config.index_head_dim,  # 128
                 query_quant_mode=0,
                 key_quant_mode=0,
                 batch_size=B,
@@ -1539,12 +1569,12 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 max_seqlen_k=topm_kvlens.max().item(),
                 layout_query="TND",
                 layout_key="PA_BSND",
-                sparse_count=self.index_topk,
+                sparse_count=index_topk,
                 sparse_mode=3,
                 pre_tokens=(1 << 63) - 1,
                 next_tokens=(1 << 63) - 1,
                 cmp_ratio=4,
-                device=str(new_k.device), #TODO(KlyzhenkoVadim): This also should be changed!
+                device=str(qlens.device),
             )
             #TODO(KlyzhenkoVadim): I think we need to add smth like
             #!!!! ustep, start_topm_cache inside TopMSubgroupMetadata!
@@ -1554,7 +1584,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 kvlens=topm_kvlens,
                 block_table=topm_block_table,
                 qli_metadata=topm_qli_metadata,
-                topm_idxs=... #TODO(KlyzhenkoVadim): What should be here? Idk...
+                topm_idxs=topm_idxs[reuse_mask],
             )
         return default_metadata, compute_topm_metadata, reuse_metadata
 
@@ -1681,13 +1711,12 @@ class AscendDSAImpl(DSAAttentionImpl):
             False,
         )
 
-        # topM
-        self.index_topm = 550 #getattr(self.vllm_config.model_config.hf_config, "index_topm", 0)
+        # topM config scalars
+        self.index_topm = 550
         self.micro_step_num = 4
-        max_batch = self.vllm_config.scheduler_config.max_num_seqs
-        self.ustep = torch.zeros(max_batch, dtype=torch.int32, device=self.wo_a.weight.device)
-        self.start_topm_cache = torch.zeros(max_batch, dtype=torch.bool, device=self.wo_a.weight.device)
-        self.topm_idxs = torch.zeros(max_batch, 1, self.index_topm, dtype=torch.int32, device=self.wo_a.weight.device)
+        # Per-request per-layer state is now stored in
+        # input_batch.topm_state[req_id][layer_name] -> TopMReqState,
+        # synced to/from decode metadata temp buffers each step.
 
     def _get_indexcache_topk_indices(self, num_tokens: int, offset: int = 0) -> torch.Tensor:
         if self.topk_indices_buffer is None:
@@ -2733,20 +2762,17 @@ class AscendDSAImpl(DSAAttentionImpl):
                 return_value=False,
                 ) # topk_idsx < 512
         else:
-            assert indexer_kv_scale_metadata.decode is not None
-            qlens = indexer_kv_scale_metadata.decode.query_start_loc[1:]
-            kvlens = indexer_kv_scale_metadata.decode.seq_lens
-            block_table = indexer_kv_scale_metadata.decode.block_table
-            qli_metadata = indexer_kv_scale_metadata.decode.qli_metadata
-            
-            #NOTE: kvlens: [B], qlens: [B] (все 1 на decode)
-            # We have three states:
-            # 1. num_actual_tokens < self.index_topm * 4 -> Do the default logic. -> default_mask
-            # 2. start_caching or ustep % micro_step_num  == 0 -> Compute topm_idxs and save it to the buffer. -> start_caching_mask
-            # 3. Reuse topm_idsx: Choose k_cache according to the topm_idxs. -> reuse_mask
-            default_meta = indexer_kv_scale_metadata.decode.default_metadata
-            compute_meta = indexer_kv_scale_metadata.decode.compute_topm_metadata
-            reuse_meta = indexer_kv_scale_metadata.decode.reuse_topm_metadata
+            decode = indexer_kv_scale_metadata.decode
+            assert decode is not None
+            qlens = decode.query_start_loc[1:]
+            kvlens = decode.seq_lens
+            block_table = decode.block_table
+            qli_metadata = decode.qli_metadata
+            B = kvlens.shape[0]
+
+            default_meta = decode.default_metadata
+            compute_meta = decode.compute_topm_metadata
+            reuse_meta = decode.reuse_topm_metadata
 
             topk_idxs = torch.zeros(B, 1, self.index_topk, dtype=torch.int32, device=q.device).fill_(-1)
 
@@ -2754,15 +2780,14 @@ class AscendDSAImpl(DSAAttentionImpl):
                 default_mask = default_meta.mask
                 topk_idxs[default_mask], _ = torch.ops._C_ascend.npu_vllm_quant_lightning_indexer(
                     query=q[default_mask],
-                    key=indexer_k_cache, # (num_slots, block_size, 1(?), head_dim(128))
+                    key=indexer_k_cache,
                     weights=DeviceOperator.prepare_dsa_indexer_weights(weights[default_mask]),
                     query_dequant_scale=DeviceOperator.prepare_dsa_indexer_query_scale(q_scale[default_mask]),
                     key_dequant_scale=DeviceOperator.prepare_dsa_indexer_key_scale(indexer_scale_cache),
                     actual_seq_lengths_query=default_meta.qlens,
-                    #because we need to change cumsum or smth...
-                    actual_seq_lengths_key=default_meta.kvlens, # TODO: Have a check whether we need  kvlens[default_state]
+                    actual_seq_lengths_key=default_meta.kvlens,
                     block_table=default_meta.block_table,
-                    metadata=default_meta.qli_metadata, #qli_metadata,#TODO: Seems like we need to recompute for sub-batch
+                    metadata=default_meta.qli_metadata,
                     query_quant_mode=0,
                     key_quant_mode=0,
                     layout_query="TND",
@@ -2773,64 +2798,55 @@ class AscendDSAImpl(DSAAttentionImpl):
                     next_tokens=(1 << 63) - 1,
                     cmp_ratio=4,
                     return_value=False,
-                ) # topk_idsx < 512
+                )
 
             if compute_meta is not None:
                 compute_mask = compute_meta.mask
-                #TODO(KlyzhenkoVadim): Solve this problem. How to save topm_idxs and pass them to the outside?
-                #Maybe something like: topm_idxs = compute_meta.topm_idxs
-                # topm_idxs = torch.ops._C_ascend.npu_vllm_quant_lightning_indexer(... ???
-                self.topm_idxs[:B][compute_mask], _ = torch.ops._C_ascend.npu_vllm_quant_lightning_indexer(
+                decode.topm_idxs[compute_mask], _ = torch.ops._C_ascend.npu_vllm_quant_lightning_indexer(
                     query=q[compute_mask],
-                    key=indexer_k_cache, # (num_slots, block_size, 1(?), head_dim(128))
+                    key=indexer_k_cache,
                     weights=DeviceOperator.prepare_dsa_indexer_weights(weights[compute_mask]),
                     query_dequant_scale=DeviceOperator.prepare_dsa_indexer_query_scale(q_scale[compute_mask]),
                     key_dequant_scale=DeviceOperator.prepare_dsa_indexer_key_scale(indexer_scale_cache),
-                    actual_seq_lengths_query=compute_meta.qlens, #qlens[compute_topm_state], #TODO(KlyzhenkoVadim): Test it!
+                    actual_seq_lengths_query=compute_meta.qlens,
                     actual_seq_lengths_key=compute_meta.kvlens,
                     block_table=compute_meta.block_table,
-                    metadata=compute_meta.qli_metadata, #qli_metadata, #TODO(KlyzhenkoVadim): Seems like we need to recompute for sub-batch
+                    metadata=compute_meta.qli_metadata,
                     query_quant_mode=0,
                     key_quant_mode=0,
                     layout_query="TND",
                     layout_key="PA_BSND",
-                    sparse_count=self.index_topm, # sparse_count <= 2048
+                    sparse_count=self.index_topm,
                     sparse_mode=3,
                     pre_tokens=(1 << 63) - 1,
                     next_tokens=(1 << 63) - 1,
                     cmp_ratio=4,
-                    return_value=False, # (seq_lens, 1, topm)
-                ) # topk_idsx < 512
-                #TODO(KlyzhenkoVadim): FIXIT!!! How should we store these parameters update????
-                topk_idxs[compute_mask] = self.topm_idxs[:B][compute_mask, :, :self.index_topk]
-                # NOTE: This is UT for checking whether mapping indices works correct
-                # self.topM_idxs = torch.tensor([[[5,3,4,2]]], dtype=topk_idxs.dtype, device=topk_idxs.device)
-                self.ustep[:B][compute_mask] += 1
+                    return_value=False,
+                )
+                topk_idxs[compute_mask] = decode.topm_idxs[compute_mask, :, :self.index_topk]
+                decode.topm_ustep[compute_mask] += 1
 
             if reuse_meta is not None:
-                reuse_topm_state = reuse_meta.mask
-                reuse_topm_qlens = self._remap_qlens(qlens, reuse_topm_state)
-                (topm_indexer_k_cache, 
-                    topm_indexer_scale_cache, 
-                    topm_block_table, 
+                reuse_mask = reuse_meta.mask
+                (topm_indexer_k_cache,
+                    topm_indexer_scale_cache,
+                    topm_block_table,
                 ) = self._prepare_k_cache_for_qli(
-                    indexer_k_cache, 
+                    indexer_k_cache,
                     indexer_scale_cache,
                     reuse_meta.block_table,
-                    # self.topm_idxs[:B][reuse_topm_state].squeeze(1), # TODO: DO we really need slice here?!!!
-                    reuse_meta.topm_idxs #FIXME: Maybe need to pass this way ????
+                    reuse_meta.topm_idxs.squeeze(1),
                 )
                 local_topk_idxs, _ = torch.ops._C_ascend.npu_vllm_quant_lightning_indexer(
-                    query=q[reuse_topm_state],
-                    key=topm_indexer_k_cache, # (n, block_size(32), 1, head_dim(128))
-                    weights=DeviceOperator.prepare_dsa_indexer_weights(weights[reuse_topm_state]),
-                    query_dequant_scale=DeviceOperator.prepare_dsa_indexer_query_scale(q_scale[reuse_topm_state]),
+                    query=q[reuse_mask],
+                    key=topm_indexer_k_cache,
+                    weights=DeviceOperator.prepare_dsa_indexer_weights(weights[reuse_mask]),
+                    query_dequant_scale=DeviceOperator.prepare_dsa_indexer_query_scale(q_scale[reuse_mask]),
                     key_dequant_scale=DeviceOperator.prepare_dsa_indexer_key_scale(topm_indexer_scale_cache),
-                    #[0,9,20,30] req_1(0,...9), req_2(10,...19), req_3(20,29) | reuse_topm_state=[True,False,True] ---> qlens[0,9,19]
                     actual_seq_lengths_query=reuse_meta.qlens,
                     actual_seq_lengths_key=reuse_meta.kvlens,
                     block_table=topm_block_table,
-                    metadata=reuse_meta.qli_metadata, # [1,0,....0] (,1024)
+                    metadata=reuse_meta.qli_metadata,
                     query_quant_mode=0,
                     key_quant_mode=0,
                     layout_query="TND",
@@ -2842,11 +2858,10 @@ class AscendDSAImpl(DSAAttentionImpl):
                     cmp_ratio=4,
                     return_value=False,
                 )
-                #NOTE: this is mapping of indices.
-                #FIXME: We need to change it maybe to 
-                topk_idxs[reuse_topm_state] = torch.gather(self.topm_idxs[:B][reuse_topm_state], dim=2, index=local_topk_idxs.long())
-                self.ustep[:B][reuse_topm_state]+=1
-            #NOTE: But finally we need to gather topk_idxs form each state!
+                topk_idxs[reuse_mask] = torch.gather(
+                    decode.topm_idxs[reuse_mask], dim=2, index=local_topk_idxs.long()
+                )
+                decode.topm_ustep[reuse_mask] += 1
         return topk_idxs
 
 
