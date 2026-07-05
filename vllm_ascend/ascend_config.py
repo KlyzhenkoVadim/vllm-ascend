@@ -287,6 +287,10 @@ class AscendConfig:
         rejection_sampler_config = additional_config.get("rejection_sampler_config", {})
         self.rejection_sampler_config = RejectionSamplerConfig(rejection_sampler_config)
 
+        #TOPM
+        self.index_topm = additional_config.get("index_topm", 550)
+        self.micro_step_num = additional_config.get("micro_step_num", 4)
+
     @staticmethod
     def _get_config_value(additional_config: dict[str, Any], config_key: str, env_key: str, env_value: Any) -> Any:
         if config_key in additional_config:

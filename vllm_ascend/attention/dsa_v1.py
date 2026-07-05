@@ -1119,7 +1119,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             if topm_ustep is not None:
                 default_metadata, compute_topm_metadata, reuse_topm_metadata = self._build_topm_subgroups(
                     qlens=query_start_loc[1:],
-                    kvlens=self.seq_lens,
+                    kvlens=self.seq_lens[: self.num_decodes],
                     block_table=self.block_table[:block_table_size, ...],
                     start_topm_cache=topm_start_cache,
                     ustep=topm_ustep,
