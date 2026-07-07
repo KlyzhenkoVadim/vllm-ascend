@@ -1107,6 +1107,29 @@ std::tuple<at::Tensor, at::Tensor> npu_vllm_quant_lightning_indexer_npu(
     return std::tuple<at::Tensor, at::Tensor>(sparse_indices_out, sparse_values_out);
 }
 
+std::tuple<at::Tensor, at::Tensor> npu_vllm_gather_topm_npu(
+    const at::Tensor &key, const at::Tensor &key_scale,
+    const at::Tensor &block_table, const at::Tensor &topm_idxs,
+    const c10::optional<at::Tensor> &actual_seq_lengths_key)
+{
+    int64_t batchSize = topm_idxs.size(0);
+    int64_t topmCount = topm_idxs.size(1);
+    int64_t blockSize = key.size(1);
+    int64_t numGatherBlocks = ((topmCount + blockSize - 1) / blockSize) * batchSize;
+    int64_t headDim = key.size(3);
+
+    at::Tensor gatheredKey = at::empty({numGatherBlocks, blockSize, 1, headDim},
+        key.options().dtype(key.dtype()));
+    at::Tensor gatheredScale = at::empty({numGatherBlocks, blockSize, 1, 1},
+        key_scale.options().dtype(key_scale.dtype()));
+
+    EXEC_NPU_CMD(aclnnVllmGatherTopm,
+        key, key_scale, block_table, topm_idxs, actual_seq_lengths_key,
+        gatheredKey, gatheredScale);
+
+    return std::tuple<at::Tensor, at::Tensor>(gatheredKey, gatheredScale);
+}
+
 std::tuple<at::Tensor, at::Tensor> construct_output_tensor(const at::Tensor &q, std::string layout,
     bool return_softmax_lse)
 {
@@ -2487,6 +2510,15 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         ") -> (Tensor sparse_indices, Tensor sparse_values)"
         );
     ops.impl("npu_vllm_quant_lightning_indexer", torch::kPrivateUse1, &vllm_ascend::npu_vllm_quant_lightning_indexer_npu);
+
+    ops.def(
+        "npu_vllm_gather_topm("
+            "Tensor key, Tensor key_scale, "
+            "Tensor block_table, Tensor topm_idxs, "
+            "Tensor? actual_seq_lengths_key=None"
+        ") -> (Tensor gathered_key, Tensor gathered_scale)"
+        );
+    ops.impl("npu_vllm_gather_topm", torch::kPrivateUse1, &vllm_ascend::npu_vllm_gather_topm_npu);
 
     ops.def(
         "npu_sparse_attn_sharedkv("

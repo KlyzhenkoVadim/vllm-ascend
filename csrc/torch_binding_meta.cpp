@@ -920,6 +920,25 @@ std::tuple<at::Tensor, at::Tensor> npu_vllm_quant_lightning_indexer_meta(
     return std::tuple<at::Tensor, at::Tensor>(sparse_indices_out, sparse_values_out);
 }
 
+std::tuple<at::Tensor, at::Tensor> npu_vllm_gather_topm_meta(
+    const at::Tensor &key, const at::Tensor &key_scale,
+    const at::Tensor &block_table, const at::Tensor &topm_idxs,
+    const c10::optional<at::Tensor> &actual_seq_lengths_key)
+{
+    int64_t batchSize = topm_idxs.size(0);
+    int64_t topmCount = topm_idxs.size(1);
+    int64_t blockSize = key.size(1);
+    int64_t numGatherBlocks = ((topmCount + blockSize - 1) / blockSize) * batchSize;
+    int64_t headDim = key.size(3);
+
+    at::Tensor gatheredKey = at::empty({numGatherBlocks, blockSize, 1, headDim},
+        key.options().dtype(key.dtype()));
+    at::Tensor gatheredScale = at::empty({numGatherBlocks, blockSize, 1, 1},
+        key_scale.options().dtype(key_scale.dtype()));
+
+    return std::tuple<at::Tensor, at::Tensor>(gatheredKey, gatheredScale);
+}
+
 std::tuple<at::Tensor, at::Tensor> construct_output_tensor(const at::Tensor &q, std::string layout,
     bool return_softmax_lse)
 {
@@ -1714,6 +1733,7 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("compressor", &vllm_ascend::meta::compressor_meta);
     ops.impl("npu_vllm_quant_lightning_indexer", &vllm_ascend::meta::npu_vllm_quant_lightning_indexer_meta);
     ops.impl("npu_vllm_quant_lightning_indexer_metadata", &vllm_ascend::meta::npu_vllm_quant_lightning_indexer_metadata_meta);
+    ops.impl("npu_vllm_gather_topm", &vllm_ascend::meta::npu_vllm_gather_topm_meta);
     ops.impl("npu_sparse_attn_sharedkv", &vllm_ascend::meta::npu_sparse_attn_sharedkv_meta);
     ops.impl("npu_sparse_attn_sharedkv_metadata", &vllm_ascend::meta::npu_sparse_attn_sharedkv_metadata_meta);
     ops.impl("npu_hc_post", &vllm_ascend::meta::npu_hc_post_meta);

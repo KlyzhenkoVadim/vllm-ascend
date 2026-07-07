@@ -3088,50 +3088,23 @@ class AscendDSAImpl(DSAAttentionImpl):
 
     def _prepare_k_cache_for_qli(
         self,
-        indexer_k_cache, # (num_slots, block_size(32), 1, head_dim(128))
-        indexer_scale_cache, # (num_slots, block_size(32), 1, 1)
-        #kvlens, # (B,) NOTE: Moved to the build_attention_metadata
-        block_table, # (B, num_block_per_req)
-        #qlens, # (B+1,) NOTE: Moved to the build_attention_metadata
-        topm_idxs # (B, index_topm)
+        indexer_k_cache,
+        indexer_scale_cache,
+        block_table,
+        topm_idxs,
     ):
-        """
-        Let's B=2, topm_idxs[[0,15,32,48],[0,10,33,60]].
-        Then logical_block_ids=[[0,0,1,1],[0,0,1,1]]. block_table=[[1,3,....],[16,18,...]].
-        Then physical_block_ids=[[1,1,3,3],[16,16,18,18]]
-        offsets=[[0,15,0,16],[0,10,1,28]]
-        """
-        #FIXME: pass it in easier way...
-        B = topm_idxs.shape[0] # num_reqs
-        block_size = indexer_k_cache.shape[1] # block_size=32
-        # TODO: When we do for several requests - Need to change:
-        logical_block_ids =  topm_idxs // block_size # (B, topm)
-        offsets = topm_idxs % block_size # (B, topm)
-        physical_block_idx = torch.gather(block_table, 1, logical_block_ids) # (B,topm)
-        topm_indexer_k_cache = indexer_k_cache[physical_block_idx, offsets] # (B, topm, 1, head_dim(128))
-        topm_indexer_scale_cache = indexer_scale_cache[physical_block_idx, offsets] # (B, topm, 1, 1)
-
-        num_blocks_per_request = cdiv(self.index_topm, block_size)
+        gathered_k, gathered_scale = torch.ops._C_ascend.npu_vllm_gather_topm(
+            key=indexer_k_cache,
+            key_scale=indexer_scale_cache,
+            block_table=block_table,
+            topm_idxs=topm_idxs.int(),
+        )
+        B = topm_idxs.shape[0]
+        block_size = indexer_k_cache.shape[1]
+        num_blocks_per_request = (self.index_topm + block_size - 1) // block_size
         num_blocks = B * num_blocks_per_request
-        new_k = torch.zeros(num_blocks,block_size, 1, self.indexer_dim, dtype=indexer_k_cache.dtype, device=indexer_k_cache.device)
-        new_scale = torch.zeros(num_blocks, block_size, 1, 1, dtype=indexer_scale_cache.dtype, device=indexer_scale_cache.device)
-        for i in range(B):
-            k_i = topm_indexer_k_cache[i]
-            scale_i = topm_indexer_scale_cache[i]
-            for b in range(num_blocks_per_request):
-                start = b * block_size
-                end = min((b + 1) * block_size, self.index_topm)
-                slot_count = end - start
-                global_block = i * num_blocks_per_request + b
-                new_k[global_block, :slot_count] = k_i[start:end]
-                new_scale[global_block, :slot_count] = scale_i[start:end]
-        new_k = new_k.contiguous()
-        new_scale = new_scale.contiguous()
-
-        #FIXME: Do we really need this topm_block_table to compute here?!
-        topm_block_table = torch.arange(num_blocks, device=block_table.device).view(B, num_blocks_per_request).to(torch.int32)
-
-        return (new_k, new_scale, topm_block_table) #FIXME: Do we really need this topm_block_table to compute here?!
+        topm_block_table = torch.arange(num_blocks, device=block_table.device, dtype=torch.int32).view(B, num_blocks_per_request)
+        return (gathered_k, gathered_scale, topm_block_table)
 
     def _remap_qlens(self, orig_qlens, mask):
         """
