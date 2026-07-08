@@ -391,6 +391,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         #TODO(KlyzhenkoVadim): Inside __init__ we should create logic
         # that will help us to determine whether it's the indexer_k_cache's metadata builder!!!
         self.kv_cache_spec = kv_cache_spec
+        self.layer_names = layer_names
         self.metadata_cls = metadata_cls if metadata_cls is not None else AscendDSAMetadata
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
@@ -1036,12 +1037,12 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             topm_ustep = torch.zeros(B, dtype=torch.int32, device=device)
             topm_start_cache = torch.zeros(B, dtype=torch.bool, device=device)
             topm_idxs = torch.zeros(B, 1, index_topm, dtype=torch.int32, device=device)
-            layer_name = f"c{self.compressor_ratio}"
+            topm_layer_name = self.layer_names[0]
             req_ids = input_batch.req_ids[:B]
             for i, rid in enumerate(req_ids):
                 if rid is None:
                     continue
-                layer_state = input_batch.topm_state.get(rid, {}).get(layer_name)
+                layer_state = input_batch.topm_state.get(rid, {}).get(topm_layer_name)
                 if layer_state is not None:
                     topm_ustep[i] = layer_state.ustep
                     topm_start_cache[i] = layer_state.start_cache
@@ -1560,13 +1561,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         #TODO(KlyzhenkoVadim): Finish it, because it's quite difficult.
         if reuse_mask.any():
             topm_qlens = self._remap_qlens(qlens, reuse_mask)
-            topm_kvlens = torch.empty_like(kvlens).fill_(index_topm * self.compressor_ratio)
-            #TODO(KlyzhenkoVadim): Adapt it to the builder! From where should we get topm_idxs???
-            # B = topm_idxs.shape[0] # num_reqs
-            # block_size = indexer_k_cache.shape[1] #TODO(KlyzhenkoVadim): This is unacceptable. Should be changed. # block_size=32
-            # num_blocks_per_request = cdiv(self.index_topm, block_size)
-            # num_blocks = B * num_blocks_per_request
-            # topm_block_table = torch.arange(num_blocks, device=block_table.device).view(B, num_blocks_per_request).to(torch.int32)
+            topm_kvlens = torch.empty_like(kvlens[reuse_mask]).fill_(index_topm * self.compressor_ratio)
             topm_block_table = block_table[reuse_mask] # NOTE: Currently let's leave this variant. Becuase block_table is needed for phys block.
             # Recompute qli_metadata
             topm_qli_metadata = torch.ops._C_ascend.npu_vllm_quant_lightning_indexer_metadata(
