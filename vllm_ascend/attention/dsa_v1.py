@@ -1031,7 +1031,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         topm_ustep = None
         topm_start_cache = None
         topm_idxs = None
-        if input_batch is not None and self.num_decodes > 0:
+        if input_batch is not None and self.num_decodes > 0 and self.compressor_ratio == 4: #TODO(KlyzhenkoVadim): Check whether this condition is correct.
             B = self.num_decodes
             device = self.seqused_q.device
             topm_ustep = torch.zeros(B, dtype=torch.int32, device=device)
@@ -1476,16 +1476,16 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
 
         B = kvlens.shape[0]
         # --- Вычисляем маски (пока используем переданные start_topm_cache/ustep) ---
-        default_mask = ~start_topm_cache[:B] | (kvlens // (4 * index_topm) == 0)
-        compute_mask = start_topm_cache[:B] & (ustep[:B] % micro_step_num == 0)
-        reuse_mask = start_topm_cache[:B] & (ustep[:B] % micro_step_num != 0)
+        short = (kvlens // (4 * index_topm) == 0)
+        cache = start_topm_cache
+        crossed = ~cache & ~short
+        cache |= crossed
+        # ustep.mul_(~crossed.int()) # Maybe just delete this? They're already 0.
 
-        crossed = (~start_topm_cache[:B]) & (kvlens // (4 * index_topm) > 0)
-        if crossed.any():
-            start_topm_cache[:B][crossed] = True
-            ustep[:B][crossed] = 0
-            default_mask[crossed] = False
-            compute_mask[crossed] = True
+        mod_zero = ustep % micro_step_num == 0
+        default_mask = ~cache | short
+        compute_mask = cache & mod_zero
+        reuse_mask = cache & ~mod_zero
 
         if default_mask.any():
             new_qlens = self._remap_qlens(qlens, default_mask)
