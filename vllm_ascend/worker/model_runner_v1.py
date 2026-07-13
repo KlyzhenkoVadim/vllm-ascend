@@ -3268,6 +3268,8 @@ class NPUModelRunner(GPUModelRunner):
                         common_ratio_to_sas_metadata=common_ratio_to_sas_metadata,
                         block_size=attn_group.kv_cache_spec.block_size,
                         )
+                    if "indexer.k_cache" in attn_group.layer_names[0]:
+                        extra_attn_metadata_args["input_batch"] = self.input_batch
 
             # add kvcomp_metadata into common_attn_metadata
             if (for_cudagraph_capture

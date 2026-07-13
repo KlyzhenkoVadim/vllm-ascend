@@ -2809,7 +2809,7 @@ class AscendDSAImpl(DSAAttentionImpl):
             # topk_idxs_default, topk_idxs_compute, topk_idxs_reuse = divide(topk_idxs, default_mask, compute_mask, reuse_mask)
             if default_meta is not None:
                 default_indices = default_meta.indices #TODO(KlyzhenkoVadim): Rename attribute.
-                topk_idxs[default_indices], _ = torch.ops._C_ascend.npu_vllm_quant_lightning_indexer(
+                default_topk_idxs, _ = torch.ops._C_ascend.npu_vllm_quant_lightning_indexer(
                     query=q[default_indices],
                     key=indexer_k_cache, # (num_slots, block_size, 1(?), head_dim(128))
                     weights=DeviceOperator.prepare_dsa_indexer_weights(weights[default_indices]),
@@ -2831,13 +2831,14 @@ class AscendDSAImpl(DSAAttentionImpl):
                     cmp_ratio=4,
                     return_value=False,
                 ) # topk_idsx < 512
+                topk_idxs[default_indices] = default_topk_idxs
 
             if compute_meta is not None:
                 compute_indices = compute_meta.indices # TODO(KlyzhenkoVadim): Rename attribute
                 #TODO(KlyzhenkoVadim): Solve this problem. How to save topm_idxs and pass them to the outside?
                 #Maybe something like: topm_idxs = compute_meta.topm_idxs
                 # topm_idxs = torch.ops._C_ascend.npu_vllm_quant_lightning_indexer(... ???
-                decode.topm_idxs[compute_indices], _ = torch.ops._C_ascend.npu_vllm_quant_lightning_indexer(
+                compute_topk_idxs, _ = torch.ops._C_ascend.npu_vllm_quant_lightning_indexer(
                     query=q[compute_indices],
                     key=indexer_k_cache, # (num_slots, block_size, 1(?), head_dim(128))
                     weights=DeviceOperator.prepare_dsa_indexer_weights(weights[compute_indices]),
@@ -2859,9 +2860,10 @@ class AscendDSAImpl(DSAAttentionImpl):
                     return_value=False, # (seq_lens, 1, topm)
                 ) # topk_idsx < 512
                 #TODO(KlyzhenkoVadim): FIXIT!!! How should we store these parameters update????
-                topk_idxs[compute_indices] = decode.topm_idxs[:B][compute_indices, :, :self.index_topk]
+                topk_idxs[compute_indices] = compute_topk_idxs[:,:,:self.index_topk]
                 # NOTE: This is UT for checking whether mapping indices works correct
                 # self.topM_idxs = torch.tensor([[[5,3,4,2]]], dtype=topk_idxs.dtype, device=topk_idxs.device)
+                decode.topm_idxs[compute_indices] = compute_topk_idxs
                 decode.topm_ustep[compute_indices] += 1
 
             if reuse_meta is not None:
