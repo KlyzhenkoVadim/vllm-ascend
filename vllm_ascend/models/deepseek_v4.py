@@ -843,6 +843,14 @@ class DeepseekV4Attention(nn.Module):
                 if 0 <= indexer_seq_idx < len(pattern):
                     skip_topk = pattern[indexer_seq_idx] == "S"
 
+        #TODO(KlyzhenkoVadim): Have a check the correctness.
+        index_topm = None
+        micro_step_num = None
+        local_k_cache_config = vllm_config.additional_config.get("local_k_cache_config", None)
+        if self.compress_ratio == 4 and local_k_cache_config is not None and ".mtp." not in prefix:
+            index_topm = local_k_cache_config.get("index_topm", None)
+            micro_step_num = local_k_cache_config.get("micro_step_num", None)
+
         ascend_device_type = get_ascend_device_type()
         k_dtype = torch.float8_e4m3fn if ascend_device_type == AscendDeviceType.A5 else torch.bfloat16
         swa_cache_layer = AscendDeepseekV4SWACache(
@@ -868,6 +876,8 @@ class DeepseekV4Attention(nn.Module):
             swa_cache_layer=swa_cache_layer,
             topk_indices_buffer=topk_indices_buffer,
             skip_topk=skip_topk,
+            index_topm=index_topm,
+            micro_step_num=micro_step_num
         )
 
         self.dsa_attn = AscendDeepseekSparseAttention(

@@ -3261,7 +3261,6 @@ class NPUModelRunner(GPUModelRunner):
                 else:
                     extra_attn_metadata_args = dict(
                         compress_ratio=compress_ratio,
-                        input_batch=self.input_batch,
                         num_reqs_actual=num_reqs_actual,
                         prefill_ratio_to_sas_metadata=prefill_ratio_to_sas_metadata,
                         decode_ratio_to_sas_metadata=decode_ratio_to_sas_metadata,

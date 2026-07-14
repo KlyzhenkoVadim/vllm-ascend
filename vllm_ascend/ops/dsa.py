@@ -112,6 +112,10 @@ class AscendDeepseekSparseAttention(MultiHeadLatentAttentionWrapper):
         self.skip_topk = dsa_modules.skip_topk
         self.prefix = prefix
 
+        #TopM
+        self.index_topm = dsa_modules.index_topm
+        self.micro_step_num = dsa_modules.micro_step_num
+
         self.swa_cache_layer = dsa_modules.swa_cache_layer
 
         self.dsa_attn = DSAAttention(
@@ -147,6 +151,9 @@ class AscendDeepseekSparseAttention(MultiHeadLatentAttentionWrapper):
             swa_cache_layer=self.swa_cache_layer,
             skip_topk=self.skip_topk,
             topk_indices_buffer=self.topk_indices_buffer,
+            #TOP M
+            index_topm=self.index_topm,
+            micro_step_num=self.micro_step_num
         )
 
         compilation_config = get_current_vllm_config().compilation_config
