@@ -2313,25 +2313,19 @@ class NPUModelRunner(GPUModelRunner):
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
-            # Sync topM state back from decode temp buffers to input_batch.topm_state
-            #TODO(KlyzhenkoVadim): Have a check.
+            # Sync topM state: topm_idxs only (ustep/start_cache already on CPU)
             if not use_spec_decode and attn_metadata is not None:
                 for layer_name, meta in attn_metadata.items():
                     decode = getattr(meta, 'decode', None)
-                    if decode is not None and decode.topm_ustep is not None:
-                        B = decode.topm_ustep.shape[0]
+                    if decode is not None and decode.topm_idxs is not None:
+                        B = decode.topm_idxs.shape[0]
                         for i, rid in enumerate(self.input_batch.req_ids[:B]):
                             if rid is None:
                                 continue
                             layer_state = self.input_batch.topm_state.setdefault(
                                 rid, {}
                             ).setdefault(layer_name, TopMReqState())
-                            layer_state.ustep = decode.topm_ustep[i].item()
-                            layer_state.start_cache = decode.topm_start_cache[i].item()
-                            #TODO(KlyzhenkoVadim): We don't need to set topm_idxs
-                            #if decode.topm_idxs[i] is zeros_like!!!
-                            if decode.topm_idxs is not None:
-                                layer_state.topm_idxs = decode.topm_idxs[i].clone()
+                            layer_state.topm_idxs = decode.topm_idxs[i].clone()
 
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None

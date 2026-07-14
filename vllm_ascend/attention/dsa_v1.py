@@ -283,12 +283,7 @@ class AscendDSADecodeMetadata:
     sas_metadata: torch.Tensor = None
     qli_metadata: torch.Tensor = None
 
-    # TopM reusing metadata
-    # TODO(KlyzhenkoVadim): Make sure whether we need this
-    # in attn_metadata, maybe it's data for current batch.
-    topm_start_cache: torch.Tensor = None # [B] bool - whether caching started for each req
     topm_idxs: torch.Tensor = None # [B,M] int32 - topm indices for each req in current batch
-    topm_ustep: torch.Tensor = None # [B] int32 - micro step for each req in current batch
     # # ... существующие поля ...
     # topm_subgroups: Dict[int, TopMSubgroupMetadata] = field(default_factory=dict)
     # # Ключи: 0 – default, 1 – compute, 2 – reuse
@@ -1022,33 +1017,32 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         n_local_heads = self.model_config.hf_config.num_attention_heads // tp_size
         index_topk = self.model_config.hf_config.index_topk
 
-        # --- topM temp buffers: filled from input_batch.topm_state ---
+        # --- topM: create topm_idxs, masks computed inside _build_topm_subgroups ---
         index_topm = None
         micro_step_num = None
         local_k_cache_config = self.vllm_config.additional_config.get("local_k_cache_config", None)
-        if local_k_cache_config is not None: #TODO(KlyzhenkoVadim): change logic to
+        if local_k_cache_config is not None:
             index_topm = local_k_cache_config.get("index_topm", None)
             micro_step_num = local_k_cache_config.get("micro_step_num", None)
-        topm_ustep = None
-        topm_start_cache = None
+
+        has_topm = (input_batch is not None and self.compressor_ratio == 4
+                    and index_topm is not None and micro_step_num is not None)
         topm_idxs = None
-        if input_batch is not None and self.compressor_ratio == 4: #TODO(KlyzhenkoVadim): Check whether this condition is correct.
+
+        if has_topm:
             B = self.num_decodes
             device = self.seqused_q.device
-            topm_ustep = torch.zeros(B, dtype=torch.int32, device=device)
-            topm_start_cache = torch.zeros(B, dtype=torch.bool, device=device)
             topm_idxs = torch.zeros(B, 1, index_topm, dtype=torch.int32, device=device)
-            topm_layer_name = self.layer_names[0]
-            req_ids = input_batch.req_ids[:B]
-            for i, rid in enumerate(req_ids):
-                if rid is None:
-                    continue
-                layer_state = input_batch.topm_state.get(rid, {}).get(topm_layer_name)
-                if layer_state is not None:
-                    topm_ustep[i] = layer_state.ustep
-                    topm_start_cache[i] = layer_state.start_cache
-                    if layer_state.topm_idxs is not None:
-                        topm_idxs[i] = layer_state.topm_idxs
+
+            if common_attn_metadata._seq_lens_cpu is not None:
+                _sl_cpu = common_attn_metadata._seq_lens_cpu
+            elif common_attn_metadata.seq_lens_cpu is not None:
+                _sl_cpu = common_attn_metadata.seq_lens_cpu
+            else:
+                _sl_cpu = common_attn_metadata.seq_lens.cpu()
+            seq_lens_np = _sl_cpu[:B].numpy()
+
+            layer_name = self.layer_names[0]
 
         assert self.decode_sas_metadata is not None
 
@@ -1122,17 +1116,18 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 )
             self.decode_sas_metadata[:1024] = self.decode_ratio_to_sas_metadata[layer_name]
             #TODO(KlyzhenkoVadim): Have a check whether this condition is correct.
-            if topm_ustep is not None:
+            if topm_idxs is not None:
                 default_metadata, compute_topm_metadata, reuse_topm_metadata = self._build_topm_subgroups(
-                    qlens=query_start_loc[1:],
+                    input_batch=input_batch,
+                    layer_name=layer_name,
+                    seq_lens_np=seq_lens_np,
                     kvlens=self.seq_lens[: self.num_decodes],
+                    qlens=query_start_loc[1:],
                     block_table=self.block_table[:block_table_size, ...],
-                    start_topm_cache=topm_start_cache,
-                    ustep=topm_ustep,
                     topm_idxs=topm_idxs,
                     index_topm=index_topm,
-                    micro_step_num=micro_step_num,
                     index_topk=index_topk,
+                    micro_step_num=micro_step_num,
                 )
         else:
             if self.decode_ratio_to_sas_metadata.get(layer_name) is None:
@@ -1204,13 +1199,10 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             start_pos=self.start_pos_decode[: self.num_decodes],  # cached
             sas_metadata=self.decode_sas_metadata,
             qli_metadata=self.decode_qli_metadata,
-            #TODO(KlyzhenkoVadim): Have a check!
-            topm_ustep=topm_ustep,
-            topm_start_cache=topm_start_cache,
             topm_idxs=topm_idxs,
-            default_metadata=default_metadata if topm_ustep is not None else None,
-            compute_topm_metadata=compute_topm_metadata if topm_ustep is not None else None,
-            reuse_topm_metadata=reuse_topm_metadata if topm_ustep is not None else None,
+            default_metadata=default_metadata,
+            compute_topm_metadata=compute_topm_metadata,
+            reuse_topm_metadata=reuse_topm_metadata,
         )
         return decode_metadata
 
@@ -1467,27 +1459,55 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         attn_metadata.attn_state = attn_state
         return attn_metadata
 
-    def _build_topm_subgroups(self, kvlens, qlens, block_table, 
-                              start_topm_cache, ustep, topm_idxs, 
-                              index_topm, micro_step_num, index_topk):
+    def _build_topm_subgroups(self, input_batch, layer_name, seq_lens_np,
+                              kvlens, qlens, block_table,
+                              topm_idxs, index_topm, index_topk, micro_step_num):
+        """Compute topm masks from CPU state, then build subgroup metadata."""
+        B = len(kvlens)
+        device = kvlens.device
+        req_ids = input_batch.req_ids[:B]
+
+        default_mask_cpu = np.zeros(B, dtype=bool)
+        compute_mask_cpu = np.zeros(B, dtype=bool)
+        reuse_mask_cpu = np.zeros(B, dtype=bool)
+
+        for i, rid in enumerate(req_ids):
+            if rid is None:
+                default_mask_cpu[i] = True
+                continue
+            state = input_batch.topm_state.get(rid, {}).get(layer_name)
+            if state is None:
+                default_mask_cpu[i] = True
+                continue
+
+            kvlen = int(seq_lens_np[i])
+            short = kvlen < 4 * index_topm
+
+            if not state.start_cache and not short:
+                state.start_cache = True
+                state.ustep = 0
+
+            cache = state.start_cache
+            mod_zero = (state.ustep % micro_step_num == 0)
+
+            default_mask_cpu[i] = (not cache) or short
+            compute_mask_cpu[i] = cache and mod_zero
+            reuse_mask_cpu[i] = cache and not mod_zero
+
+            if state.topm_idxs is not None:
+                topm_idxs[i] = state.topm_idxs
+
+            if compute_mask_cpu[i] or reuse_mask_cpu[i]:
+                state.ustep += 1
+
+        default_mask = torch.from_numpy(default_mask_cpu).to(device)
+        compute_mask = torch.from_numpy(compute_mask_cpu).to(device)
+        reuse_mask = torch.from_numpy(reuse_mask_cpu).to(device)
 
         default_metadata = None
         compute_topm_metadata = None
         reuse_metadata = None
 
-        # --- Вычисляем маски (пока используем переданные start_topm_cache/ustep) ---
-        short = (kvlens // (4 * index_topm) == 0)
-        cache = start_topm_cache
-        crossed = ~cache & ~short
-        cache |= crossed
-        # ustep.mul_(~crossed.int()) # Maybe just delete this? They're already 0.
-
-        mod_zero = ustep % micro_step_num == 0
-        default_mask = ~cache | short
-        compute_mask = cache & mod_zero
-        reuse_mask = cache & ~mod_zero
-
-        #Turn masks to indices
         default_indices = torch.where(default_mask)[0]
         compute_indices = torch.where(compute_mask)[0]
         reuse_indices = torch.where(reuse_mask)[0]
@@ -2856,7 +2876,6 @@ class AscendDSAImpl(DSAAttentionImpl):
                 # index_copy_ instead of index_put: avoids temp allocation + faster scatter
                 topk_idxs.index_copy_(0, compute_indices.long(), compute_topk_idxs[:, :, :self.index_topk])
                 decode.topm_idxs.index_copy_(0, compute_indices.long(), compute_topk_idxs)
-                decode.topm_ustep.index_add_(0, compute_indices.long(), torch.ones(len(compute_indices), dtype=torch.int32, device=compute_indices.device))
 
             if reuse_meta is not None:
                 reuse_indices = reuse_meta.indices
@@ -2892,7 +2911,6 @@ class AscendDSAImpl(DSAAttentionImpl):
                 )
                 gathered = torch.gather(decode.topm_idxs[reuse_indices], dim=2, index=local_topk_idxs.long())
                 topk_idxs.index_copy_(0, reuse_indices.long(), gathered)
-                decode.topm_ustep.index_add_(0, reuse_indices.long(), torch.ones(len(reuse_indices), dtype=torch.int32, device=reuse_indices.device))
             #NOTE: But finally we need to gather topk_idxs form each state!
         return topk_idxs
 
