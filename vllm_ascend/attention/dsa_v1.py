@@ -292,9 +292,9 @@ class AscendDSADecodeMetadata:
     # # ... существующие поля ...
     # topm_subgroups: Dict[int, TopMSubgroupMetadata] = field(default_factory=dict)
     # # Ключи: 0 – default, 1 – compute, 2 – reuse
-    default_metadata: List[TopMSubgroupMetadata] = None
-    compute_topm_metadata: List[TopMSubgroupMetadata] = None
-    reuse_topm_metadata: List[TopMSubgroupMetadata] = None
+    default_metadata: TopMSubgroupMetadata = None
+    compute_topm_metadata: TopMSubgroupMetadata = None
+    reuse_topm_metadata: TopMSubgroupMetadata = None
 
 @dataclass
 class AscendDSAMetadata:
