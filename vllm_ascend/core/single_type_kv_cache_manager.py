@@ -265,11 +265,13 @@ def get_manager_for_kv_cache_spec(
     """
     from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry  # type: ignore[import-not-found]
 
-    from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
+    from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, FixedCacheSpec
 
     manager_class = KVCacheSpecRegistry.get_manager_class(kv_cache_spec)
     assert manager_class is not None, f"No KV cache manager registered for {type(kv_cache_spec).__name__}"
-    if isinstance(kv_cache_spec, AscendMLAAttentionSpec) and kv_cache_spec.compress_ratio > 1:
+    if isinstance(kv_cache_spec, FixedCacheSpec):
+        manager_class = FixedCacheManager
+    elif isinstance(kv_cache_spec, AscendMLAAttentionSpec) and kv_cache_spec.compress_ratio > 1:
         manager_class = CompressAttentionManager
         if max_model_len is not None:
             # Compressed-MLA peak in blocks: ceil(max_model_len/compress/block).
@@ -292,3 +294,84 @@ def get_manager_for_kv_cache_spec(
             )
     manager = manager_class(kv_cache_spec, **kwargs)
     return manager
+
+
+class FixedCacheManager(SingleTypeKVCacheManager):
+    """KV cache manager for a fixed-size index cache (topM local cache per request).
+
+    Each request gets ``fixed_token_lengths`` tokens worth of blocks allocated
+    once at first touch and never expanded.  Used by IndexCache20 anchor/reuse
+    decode path where the local indexer cache is a fixed-size ring buffer.
+    """
+
+    def __init__(self, kv_cache_spec, block_pool: BlockPool, **kwargs) -> None:
+        super().__init__(kv_cache_spec, block_pool, **kwargs)
+        from vllm_ascend.core.kv_cache_interface import FixedCacheSpec
+
+        assert isinstance(kv_cache_spec, FixedCacheSpec)
+        assert self.dcp_world_size == 1
+        assert self.pcp_world_size == 1
+        self.compress_ratio = kv_cache_spec.compress_ratio
+        self.fixed_token_lengths = kv_cache_spec.fixed_cache_lengths
+        self.num_fixed_blocks = self.fixed_token_lengths // self.block_size
+
+    def get_num_blocks_to_allocate(
+        self,
+        request_id: str,
+        num_tokens: int,
+        new_computed_blocks: Sequence[KVCacheBlock],
+        total_computed_tokens: int,
+        num_tokens_main_model: int,
+        apply_admission_cap: bool = False,
+    ) -> int:
+        # Once blocks are allocated, never allocate more.
+        if request_id in self.req_to_blocks and len(self.req_to_blocks[request_id]) > 0:
+            return 0
+        return self.num_fixed_blocks
+
+    def allocate_new_blocks(
+        self, request_id: str, num_tokens: int, num_tokens_main_model: int
+    ) -> list[KVCacheBlock]:
+        req_blocks = self.req_to_blocks[request_id]
+        if len(req_blocks) > 0:
+            return []
+        new_blocks = self.block_pool.get_new_blocks(self.num_fixed_blocks)
+        req_blocks.extend(new_blocks)
+        self.new_block_ids.extend(b.block_id for b in new_blocks)
+        return new_blocks
+
+    def allocate_new_computed_blocks(
+        self,
+        request_id: str,
+        new_computed_blocks: Sequence[KVCacheBlock],
+        num_local_computed_tokens: int,
+        num_external_computed_tokens: int,
+    ) -> None:
+        return
+
+    def cache_blocks(self, request: Request, num_tokens: int, **kwargs) -> None:
+        return
+
+    def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
+        return 0
+
+    def remove_skipped_blocks(self, request_id: str, total_computed_tokens: int) -> None:
+        return
+
+    @classmethod
+    def find_longest_cache_hit(
+        cls,
+        block_hashes: BlockHashList,
+        max_length: int,
+        kv_cache_group_ids: list[int],
+        block_pool: BlockPool,
+        kv_cache_spec: KVCacheSpec,
+        use_eagle: bool,
+        alignment_tokens: int,
+        dcp_world_size: int = 1,
+        pcp_world_size: int = 1,
+    ) -> tuple[list[KVCacheBlock], ...]:
+        return tuple([] for _ in range(len(kv_cache_group_ids)))
+
+    def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
+        return 0

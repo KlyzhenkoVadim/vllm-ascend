@@ -12,7 +12,7 @@ from vllm.v1.core.single_type_kv_cache_manager import SlidingWindowManager
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MLAAttentionSpec, SlidingWindowMLASpec
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 
-from vllm_ascend.core.single_type_kv_cache_manager import CompressAttentionManager
+from vllm_ascend.core.single_type_kv_cache_manager import CompressAttentionManager, FixedCacheManager
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
 
@@ -246,6 +246,47 @@ class AscendSlidingWindowMLASpec(SlidingWindowMLASpec):
         )
 
 
+@dataclass(frozen=True, kw_only=True)
+class FixedCacheSpec(AscendMLAAttentionSpec):
+    """KV cache spec for a fixed-size index cache (topM local cache).
+
+    Used for IndexCache20-style anchor/reuse decode:
+    each request gets a fixed number of blocks allocated once
+    and never expanded.
+    """
+
+    fixed_cache_lengths: int = 2048  # tokens worth of fixed cache per request
+
+    @property
+    def num_fixed_blocks(self) -> int:
+        return cdiv(self.fixed_cache_lengths, self.storage_block_size)
+
+    def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
+        return self.num_fixed_blocks * self.page_size_bytes
+
+    @classmethod
+    def merge(cls, specs: list[Self]) -> Self:
+        assert all(isinstance(spec, FixedCacheSpec) for spec in specs), (
+            "All attention layers in the same KV cache group must be FixedCacheSpec."
+        )
+        fixed_lengths_set = set(spec.fixed_cache_lengths for spec in specs)
+        assert len(fixed_lengths_set) == 1, (
+            "All attention layers in the same KV cache group must use "
+            "the same fixed_cache_lengths."
+        )
+        return cls(
+            block_size=specs[0].block_size,
+            num_kv_heads=specs[0].num_kv_heads,
+            head_size=specs[0].head_size,
+            dtype=specs[0].dtype,
+            page_size_padded=specs[0].page_size_padded,
+            cache_dtype_str=specs[0].cache_dtype_str,
+            compress_ratio=specs[0].compress_ratio,
+            model_version=specs[0].model_version,
+            fixed_cache_lengths=fixed_lengths_set.pop(),
+        )
+
+
 def register_ascend_kv_cache_specs() -> None:
     KVCacheSpecRegistry.register(
         kvcache_spec_cls=AscendMLAAttentionSpec,
@@ -256,4 +297,9 @@ def register_ascend_kv_cache_specs() -> None:
         kvcache_spec_cls=AscendSlidingWindowMLASpec,
         manager_class=SlidingWindowManager,
         uniform_type_base_spec=SlidingWindowMLASpec,
+    )
+    KVCacheSpecRegistry.register(
+        kvcache_spec_cls=FixedCacheSpec,
+        manager_class=FixedCacheManager,
+        uniform_type_base_spec=AscendMLAAttentionSpec,
     )
