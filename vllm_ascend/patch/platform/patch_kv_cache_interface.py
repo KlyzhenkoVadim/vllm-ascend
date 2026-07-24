@@ -1,35 +1,55 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import torch
+import vllm.model_executor.layers.attention.mla_attention
+import vllm.v1.kv_cache_interface
 from typing_extensions import Self
 from vllm.config import VllmConfig
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import get_dtype_size
-from vllm.v1.core.single_type_kv_cache_manager import SlidingWindowManager
 from vllm.v1.kv_cache_interface import (
-    AttentionSpec,
-    FullAttentionSpec,
     MLAAttentionSpec,
     SlidingWindowMLASpec,
 )
-from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
+from vllm_ascend.core.kv_cache_interface import FixedCacheSpec
 
-from vllm_ascend.core.single_type_kv_cache_manager import CompressAttentionManager
-from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
+@dataclass(frozen=True)
+class AscendFixedCacheSpec(FixedCacheSpec):
+    scale_dim: int = 0
+    scale_dtype: torch.dtype = torch.int8
+    cache_sparse_c8: bool = False
+    c8_k_cache_dtype: torch.dtype = torch.int8
+    c8_k_scale_cache_dtype: torch.dtype = torch.float16
+    fixed_token_lengths: int = 2048
 
+    @property
+    def page_size_bytes(self) -> int:
+        if self.cache_sparse_c8:
+            num_heads_per_page = self.block_size * self.num_kv_heads
+            # kv_cache[0]: int8
+            index_head_dim = self.sparse_head_dim[-1]
+            indexer_k_bytes = num_heads_per_page * index_head_dim * get_dtype_size(self.c8_k_cache_dtype)
+            # kv_cache[1]: float16
+            # since the scale is stored per token, head_dim is set to 1.
+            index_scale_head_dim = 1
+            indexer_k_scale_bytes = (
+                num_heads_per_page * index_scale_head_dim * get_dtype_size(self.c8_k_scale_cache_dtype)
+            )
+            return indexer_k_bytes + indexer_k_scale_bytes
 
-def _get_c8_k_cache_dtype() -> torch.dtype:
-    return torch.float8_e4m3fn if get_ascend_device_type() == AscendDeviceType.A5 else torch.int8
+        return (
+            self.block_size
+            * self.num_kv_heads
+            * (self.head_size * get_dtype_size(self.dtype) + self.scale_dim * get_dtype_size(self.scale_dtype))
+        )
+    
+    def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
+        return cdiv(self.fixed_token_lengths, self.block_size * self.compress_ratio) * self.page_size_bytes
 
-
-def _get_c8_k_scale_cache_dtype() -> torch.dtype:
-    return torch.float32 if get_ascend_device_type() == AscendDeviceType.A5 else torch.float16
-
-
-@dataclass(frozen=True, kw_only=True)
+@dataclass(frozen=True)
 class AscendMLAAttentionSpec(MLAAttentionSpec):
     """MLAAttentionSpec extended to support DSA models, with optional Sparse C8 support.
 
@@ -59,8 +79,8 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
     scale_dtype: torch.dtype = torch.int8
     sparse_head_dim: tuple[int, ...] | None = None
     cache_sparse_c8: bool = False
-    c8_k_cache_dtype: torch.dtype = field(default_factory=_get_c8_k_cache_dtype)
-    c8_k_scale_cache_dtype: torch.dtype = field(default_factory=_get_c8_k_scale_cache_dtype)
+    c8_k_cache_dtype: torch.dtype = torch.int8
+    c8_k_scale_cache_dtype: torch.dtype = torch.float16
 
     @property
     def page_size_bytes(self) -> int:
@@ -68,22 +88,19 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
             assert self.sparse_head_dim is not None
             assert len(self.sparse_head_dim) == 3
             num_heads_per_page = self.block_size * self.num_kv_heads
-
-            kv_lora_rank, qk_rope_head_dim, index_head_dim = self.sparse_head_dim
-
-            # A5: kv_lora and k_rope are merged into a single CKV tensor (fp8).
-            # A3: separate kv_lora + k_rope (bf16).
-            if qk_rope_head_dim == 0:
-                kv_dtype = self.c8_k_cache_dtype  # A5 CKV: float8_e4m3fn
-                kv_dim = kv_lora_rank
-            else:
-                kv_dtype = self.dtype  # A3 kv_lora + k_rope: bfloat16
-                kv_dim = kv_lora_rank + qk_rope_head_dim
-
-            kv_bytes = num_heads_per_page * kv_dim * get_dtype_size(kv_dtype)
-            qli_bytes = num_heads_per_page * index_head_dim * get_dtype_size(self.c8_k_cache_dtype)
-            qli_scale_bytes = num_heads_per_page * 1 * get_dtype_size(self.c8_k_scale_cache_dtype)
-            return kv_bytes + qli_bytes + qli_scale_bytes
+            # kv_cache[0]: bfloat16, kv_cache[1]: bfloat16
+            kv_lora_rank, qk_rope_head_dim = self.sparse_head_dim[:2]
+            k_pe_nope_bytes = num_heads_per_page * (kv_lora_rank + qk_rope_head_dim) * get_dtype_size(self.dtype)
+            # kv_cache[2]: int8
+            index_head_dim = self.sparse_head_dim[-1]
+            indexer_k_bytes = num_heads_per_page * index_head_dim * get_dtype_size(self.c8_k_cache_dtype)
+            # kv_cache[3]: float16
+            # since the scale is stored per token, head_dim is set to 1.
+            index_scale_head_dim = 1
+            indexer_k_scale_bytes = (
+                num_heads_per_page * index_scale_head_dim * get_dtype_size(self.c8_k_scale_cache_dtype)
+            )
+            return k_pe_nope_bytes + indexer_k_bytes + indexer_k_scale_bytes
 
         return (
             self.block_size
@@ -101,7 +118,7 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
             - kv_cache[0]
             - kv_cache[1]
             - kv_cache[2]
-            - kv_cache[3] (None if Sparse C8 is disabled or Sparse C8 on A5 device)
+            - kv_cache[3] (None if Sparse C8 is disabled)
         """
 
         assert self.sparse_head_dim is not None
@@ -112,15 +129,6 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
 
             kv_lora_rank, qk_rope_head_dim, index_k_head_dim = self.sparse_head_dim
 
-            if qk_rope_head_dim == 0:
-                # A5: ckv (float8_e4m3fn) and qli share c8_k_cache_dtype;
-                ckv_virtual = kv_lora_rank * get_dtype_size(self.c8_k_cache_dtype)
-                qk_rope_virtual = 0
-                qli_virtual = index_k_head_dim * get_dtype_size(self.c8_k_cache_dtype)
-                scale_virtual = get_dtype_size(self.c8_k_scale_cache_dtype)
-                return (ckv_virtual, qk_rope_virtual, qli_virtual, scale_virtual)
-
-            # A3: keep the original element-count / byte mix
             factor = get_dtype_size(self.dtype) // get_dtype_size(self.c8_k_cache_dtype)
             index_k_head_dim_virtual = index_k_head_dim // factor
 
@@ -138,22 +146,12 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
             virtual_dims = get_sparse_head_dim_virtual()
             total_virtual_head_dim = sum(virtual_dims)
 
-            if virtual_dims[1] == 0:
-                # A5: ckv merged (kv_lora + k_rope + scale) -> 3-tensor
-                return (
-                    total_virtual_head_dim / virtual_dims[0],  # kv_cache[0]: ckv
-                    total_virtual_head_dim / virtual_dims[2],  # kv_cache[1]: qli
-                    total_virtual_head_dim / virtual_dims[3],  # kv_cache[2]: qli_scale
-                    None,  # kv_cache[3] does not exist for A5
-                )
-            else:
-                # A3: 4-tensor
-                return (
-                    total_virtual_head_dim / virtual_dims[0],  # kv_cache[0]
-                    total_virtual_head_dim / virtual_dims[1],  # kv_cache[1]
-                    total_virtual_head_dim / virtual_dims[2],  # kv_cache[2]
-                    total_virtual_head_dim / virtual_dims[3],  # kv_cache[3]
-                )
+            return (
+                total_virtual_head_dim / virtual_dims[0],  # kv_cache[0]
+                total_virtual_head_dim / virtual_dims[1],  # kv_cache[1]
+                total_virtual_head_dim / virtual_dims[2],  # kv_cache[2]
+                total_virtual_head_dim / virtual_dims[3],  # kv_cache[3]
+            )
 
         return (
             self.head_size / self.sparse_head_dim[0],  # kv_cache[0]
@@ -180,7 +178,6 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
             num_kv_heads=specs[0].num_kv_heads,
             head_size=specs[0].head_size,
             scale_dim=specs[0].scale_dim,
-            scale_dtype=specs[0].scale_dtype,
             sparse_head_dim=specs[0].sparse_head_dim,
             dtype=specs[0].dtype,
             cache_dtype_str=cache_dtype_str_set.pop(),
@@ -198,6 +195,22 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
         return cdiv(max_model_len, self.block_size * self.compress_ratio) * self.page_size_bytes
 
 
+def _init_mla_cache_fields(spec: MLAAttentionSpec | SlidingWindowMLASpec):
+    """Shared MLA cache init logic for quantiztion format across different models."""
+    FP8_DTYPE = "fp8_ds_mla"
+    MODEL_VERSIONS = ["v32", "deepseek_v4"]
+    if spec.cache_dtype_str != FP8_DTYPE:
+        return
+    assert spec.model_version in MODEL_VERSIONS, "Invalid model version."
+    assert (spec.model_version == "v32" and spec.compress_ratio == 1) or (
+        spec.model_version == "deepseek_v4" and spec.compress_ratio in [0, 4, 128]
+    ), "Invalid compress ratio."
+    if spec.compress_ratio > 1:
+        assert spec.block_size % spec.compress_ratio == 0, (
+            f"Block size {spec.block_size} must be divisible by compress ratio."
+        )
+
+
 @dataclass(frozen=True, kw_only=True)
 class AscendSlidingWindowMLASpec(SlidingWindowMLASpec):
     """Sliding window attention with MLA cache format."""
@@ -207,9 +220,6 @@ class AscendSlidingWindowMLASpec(SlidingWindowMLASpec):
     alignment: int | None = None  # Default to None for no padding.
     compress_ratio: int = 1
     model_version: str | None = None
-
-    def __post_init__(self):
-        pass
 
     @property
     def storage_block_size(self) -> int:
@@ -221,8 +231,8 @@ class AscendSlidingWindowMLASpec(SlidingWindowMLASpec):
 
     @classmethod
     def merge(cls, specs: list[Self]) -> Self:
-        assert all(isinstance(spec, AscendSlidingWindowMLASpec) for spec in specs), (
-            "All attention layers in the same KV cache group must be AscendSlidingWindowMLASpec."
+        assert all(isinstance(spec, SlidingWindowMLASpec) for spec in specs), (
+            "All attention layers in the same KV cache group must be SlidingWindowMLASpec."
         )
         cache_dtype_str_set = set(spec.cache_dtype_str for spec in specs)
         compress_ratio_set = set(spec.compress_ratio for spec in specs)
@@ -251,88 +261,7 @@ class AscendSlidingWindowMLASpec(SlidingWindowMLASpec):
         )
 
 
-@dataclass(frozen=True, kw_only=True)
-class FixedCacheSpec(AttentionSpec):
-    head_size_v: int = None  # type: ignore[assignment]
-    cache_dtype_str: str | None = None
-    alignment: int | None = None
-    compress_ratio: int = 1
-    model_version: str | None = None
-    fixed_token_lengths: int = 2048
-    attention_chunk_size: int | None = None
-
-    def __post_init__(self):
-        if self.head_size_v is None:
-            object.__setattr__(self, "head_size_v", self.head_size)
-
-        if self.alignment is not None:
-            actual_page_size = self.real_page_size_bytes
-            padding = self.alignment - (actual_page_size % self.alignment)
-            if padding != self.alignment:
-                object.__setattr__(self, "page_size_padded", actual_page_size + padding)
-
-    @property
-    def storage_block_size(self) -> int:
-        return self.block_size // self.compress_ratio
-
-    def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
-        return cdiv(self.fixed_token_lengths, self.block_size) * self.page_size_bytes
-
-    @property
-    def real_page_size_bytes(self) -> int:
-        if self.cache_dtype_str == "fp8_ds_mla":
-            if self.model_version == "deepseek_v4":
-                return self.storage_block_size * 584
-            return self.block_size * 656
-        return (
-            self.storage_block_size
-            * self.num_kv_heads
-            * self.head_size
-            * get_dtype_size(self.dtype)
-        )
-
-    @classmethod
-    def merge(cls, specs: list[Self]) -> Self:
-        assert all(isinstance(spec, FixedCacheSpec) for spec in specs), (
-            "All indexer local cache of attention layers in the same KV cache group must be FixedCacheSpec."
-        )
-        cache_dtype_str_set = set(spec.cache_dtype_str for spec in specs)
-        compress_ratio_set = set(spec.compress_ratio for spec in specs)
-        model_version_set = set(spec.model_version for spec in specs)
-        assert (
-            len(cache_dtype_str_set) == 1
-            and len(compress_ratio_set) == 1
-            and len(model_version_set) == 1
-        ), (
-            "All attention layers in the same KV cache group must use the same "
-            "quantization method, compress ratio, and model version."
-        )
-        return cls(
-            block_size=specs[0].block_size,
-            num_kv_heads=specs[0].num_kv_heads,
-            head_size=specs[0].head_size,
-            dtype=specs[0].dtype,
-            kv_quant_mode=specs[0].kv_quant_mode,
-            page_size_padded=specs[0].page_size_padded,
-            cache_dtype_str=cache_dtype_str_set.pop(),
-            compress_ratio=compress_ratio_set.pop(),
-            model_version=model_version_set.pop(),
-        )
-
-
-# Register FixedCacheSpec in upstream vllm so it's importable by patches
-import vllm.v1.kv_cache_interface as _kvcif
-_kvcif.FixedCacheSpec = FixedCacheSpec  # type: ignore[attr-defined]
-
-
-def register_ascend_kv_cache_specs() -> None:
-    KVCacheSpecRegistry.register(
-        kvcache_spec_cls=AscendMLAAttentionSpec,
-        manager_class=CompressAttentionManager,
-        uniform_type_base_spec=FullAttentionSpec,
-    )
-    KVCacheSpecRegistry.register(
-        kvcache_spec_cls=AscendSlidingWindowMLASpec,
-        manager_class=SlidingWindowManager,
-        uniform_type_base_spec=SlidingWindowMLASpec,
-    )
+vllm.v1.kv_cache_interface.MLAAttentionSpec = AscendMLAAttentionSpec
+vllm.v1.kv_cache_interface.SlidingWindowMLASpec = AscendSlidingWindowMLASpec
+vllm.v1.kv_cache_interface.FixedCacheSpec = AscendFixedCacheSpec
+vllm.model_executor.layers.attention.mla_attention.MLAAttentionSpec = AscendMLAAttentionSpec

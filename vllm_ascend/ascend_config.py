@@ -287,6 +287,12 @@ class AscendConfig:
         rejection_sampler_config = additional_config.get("rejection_sampler_config", {})
         self.rejection_sampler_config = RejectionSamplerConfig(rejection_sampler_config)
 
+        self.enable_local_k_cache = additional_config.get("enable_local_k_cache", False)
+        self.indexcache_anchor_interval = additional_config.get("indexcache_anchor_interval", 4)
+        self.indexcache_topm = additional_config.get("indexcache_topm", 2048)
+        self.indexcache_prefill_topm = additional_config.get("indexcache_prefill_topm", 16384)
+        self.indexcache_buffer_len = additional_config.get("indexcache_buffer_len", 16384)
+
     @staticmethod
     def _get_config_value(additional_config: dict[str, Any], config_key: str, env_key: str, env_value: Any) -> Any:
         if config_key in additional_config:

@@ -630,6 +630,140 @@ def update_cudagraph_capture_sizes(vllm_config: VllmConfig, cudagraph_capture_si
     vllm_config.compilation_config.post_init_cudagraph_sizes()
 
 
+def update_aclgraph_sizes(vllm_config: VllmConfig) -> None:
+    """Update ACL graph capture sizes based on hardware limitations"""
+    # Currently, we can only capture 1800 graphs at most,
+    # due to the limitation of ACL graph. This number is bounded by
+    # the number of streams, which is 2048, we save 248 streams
+    # as a buffer.
+    # Maximum number of graphs that can be captured by ACL Graph
+    # Find out whether we need to solve allreduce function
+    MAX_CAPTURE_SIZE = 1800
+
+    # enable pcp or dcp will add new communication and consume additional approximately less than 100 streams
+    CP_ADDITIONAL_STREAM_NUM = 100
+
+    # Store original configuration and temporarily clear it
+    compilation_config = vllm_config.compilation_config
+    original_sizes, compilation_config.cudagraph_capture_sizes = compilation_config.cudagraph_capture_sizes, None
+
+    # Calculate parallel configuration factor
+    if not vllm_config.model_config:
+        logger.warning(
+            "Got empty model config. This typically occurs when an empty vllm_config is "
+            "initialized (e.g., in unit tests), where config updates are intentionally skipped."
+        )
+
+        return
+    hf_config = vllm_config.model_config.hf_text_config
+    if hasattr(hf_config, "num_hidden_layers"):
+        num_hidden_layers = hf_config.num_hidden_layers
+    else:
+        num_hidden_layers = get_max_hidden_layers(hf_config)
+    parallel_config = vllm_config.parallel_config
+
+    # Calculate maximum supported batch sizes considering model architecture
+    resources_per_graph = num_hidden_layers + 1
+    # For suffix decoding, use the suffix path when no draft_model_config is provided.
+    if (spec := vllm_config.speculative_config) and (draft := spec.draft_model_config):
+        # Use get_total_num_hidden_layers() to correctly handle MTP models,
+        # which store layer count in num_nextn_predict_layers or
+        # mtp_num_hidden_layers (for Qwen3.5) instead of num_hidden_layers.
+        resources_per_graph += draft.get_total_num_hidden_layers() + 1
+
+    # Find out whether we need to take into account the pp_size
+    num_comm_groups = sum(
+        size > 1
+        for size in [
+            parallel_config.data_parallel_size,
+            parallel_config.tensor_parallel_size,
+        ]
+    )
+
+    if os.getenv("HCCL_OP_EXPANSION_MODE") == "AIV":
+        # Find out whether we need to take into account the pp_size
+        parallel_factor = (
+            1
+            + num_comm_groups
+            + int(parallel_config.enable_expert_parallel)
+            + int(vllm_config.additional_config.get("multistream_overlap_shared_expert", False))
+        )
+        if is_moe_model(vllm_config):
+            parallel_factor += parallel_config.data_parallel_size > 1
+        else:
+            # When AIV mode is enabled, the allreduce operator of the dense
+            # layer model will occupy additional streams, which are buffered here.
+            MAX_CAPTURE_SIZE = MAX_CAPTURE_SIZE - parallel_factor * resources_per_graph
+
+        # Calculate maximum supported batch sizes considering model architecture on the A2 Hardware Device
+        # Assume the following case:
+        # MAX_CAPTURE_SIZE = 1920, num_hidden_layers = 48, data_parallel_size is 1, tensor_parallel_size is 4,
+        # According to the formula, max_num_batch_sizes = math.floor(1920 / (48 + 1) / 2) = 19
+        max_num_batch_sizes = math.floor(MAX_CAPTURE_SIZE / resources_per_graph / parallel_factor)
+        logger.info("Calculated maximum supported batch sizes for ACL graph: %s", max_num_batch_sizes)
+    else:
+        # enable pcp or dcp will add new communication and consume additional approximately less than 100 streams
+        if parallel_config.prefill_context_parallel_size > 1:
+            MAX_CAPTURE_SIZE = MAX_CAPTURE_SIZE - CP_ADDITIONAL_STREAM_NUM
+        if parallel_config.decode_context_parallel_size > 1:
+            MAX_CAPTURE_SIZE = MAX_CAPTURE_SIZE - CP_ADDITIONAL_STREAM_NUM
+
+        # The above describes an empirical formula applicable to the A2 hardware.
+        # Under this configuration, HCCL employs the FFTS+ method for execution unfolding,
+        # which adds only 1 concurrent stream without consuming collective communication execution unfolding streams.
+        # On A3 hardware, HCCL defaults to the AICPU method.
+        # This approach may additionally allocate up to rank_size (max 16) - 1 streams per collective communication
+        # domain on the device (worst case).
+        # Using the default collective communication unfolding method on A3 will lead to a significant reduction
+        # in the maximum supported sizes.
+        # Therefore, the calculation formula has been modified as follows:
+        # Assume the following case:
+        # MAX_CAPTURE_SIZE = 1920, num_hidden_layers = 48, data_parallel_size is 1, tensor_parallel_size is 4,
+        # According to the formula, max_num_batch_sizes = math.floor((1920 - 1 * 40) / (48 + 1) / (1 + 1 * 2)) = 12
+        max_num_batch_sizes = math.floor(
+            (MAX_CAPTURE_SIZE - num_comm_groups * 40) / resources_per_graph / (1 + num_comm_groups * 2)
+        )
+        logger.info("Calculated maximum supported batch sizes for ACL graph: %s", max_num_batch_sizes)
+        logger.warning(
+            "Currently, communication is performed using FFTS+ method, which reduces "
+            "the number of available streams and, as a result, limits the range of runtime "
+            "shapes that can be handled. To both improve communication performance and "
+            "increase the number of supported shapes, set HCCL_OP_EXPANSION_MODE=AIV."
+        )
+
+    arch_name = vllm_config.model_config.architecture
+
+    # If original sizes exceed maximum, sample a representative subset
+    if max_num_batch_sizes < len(original_sizes):
+        # Sample uniformly from original sizes
+        step = (len(original_sizes) - 1) / (max_num_batch_sizes - 1)
+        indices = [round(i * step) for i in range(max_num_batch_sizes)]
+
+        # Ensure first and last elements are preserved
+        indices[0], indices[-1] = 0, len(original_sizes) - 1
+
+        sampled_sizes = [original_sizes[i] for i in indices]
+        update_cudagraph_capture_sizes(vllm_config, sampled_sizes)
+        logger.info(
+            "Adjusted ACL graph batch sizes for %s model (layers: %d): %d → %d sizes",
+            arch_name,
+            num_hidden_layers,
+            len(original_sizes),
+            len(
+                compilation_config.cudagraph_capture_sizes  # type: ignore[arg-type]
+            ),
+        )
+    else:
+        # No adjustment needed
+        compilation_config.cudagraph_capture_sizes = original_sizes
+        logger.info(
+            "No adjustment needed for ACL graph batch sizes: %s model (layers: %d) with %d sizes",
+            arch_name,
+            num_hidden_layers,
+            len(original_sizes),
+        )
+
+
 # TODO(wxy): Move to ops module
 def dispose_tensor(x: torch.Tensor):
     x.set_(torch.empty((0,), device=x.device, dtype=x.dtype))
@@ -638,7 +772,7 @@ def dispose_tensor(x: torch.Tensor):
 def register_ascend_customop(vllm_config: VllmConfig | None = None):
     """Register Ascend CustomOP
 
-    NOTE: if the register branch requires model type, please use `vllm.config.get_current_vllm_config`,
+    if the register branch requires model type, please use `vllm.config.get_current_vllm_config`,
     and ensure this will execute after model config is initilazed.
     """
     global _ASCEND_CUSTOMOP_IS_REIGISTERED
@@ -761,7 +895,7 @@ def register_ascend_customop(vllm_config: VllmConfig | None = None):
     for name, op_cls in REGISTERED_ASCEND_OPS.items():
         CustomOp.register_oot(_decorated_op_cls=op_cls, name=name)
 
-    # NOTE: Keep this at last to ensure all custom actions are registered
+    # Keep this at last to ensure all custom actions are registered
     _ASCEND_CUSTOMOP_IS_REIGISTERED = True
 
 
@@ -873,7 +1007,7 @@ def enable_sp(vllm_config=None, enable_shared_expert_dp: bool = False) -> bool:
     return bool(_ENABLE_SP)
 
 
-# TODO remove it after vllm has this func
+# remove it after vllm has this func
 def shared_expert_dp_enabled() -> bool:
     return get_ascend_config().enable_shared_expert_dp or enable_sp() or enable_sp_by_pass()
 
@@ -1050,7 +1184,7 @@ def get_hccl_config_for_pg_options(group_name: str) -> dict | None:
     Returns:
         HCCL pg_options or None for mc2 group
     """
-    # FIXME: Current mc2 operators only perform communication space partitioning
+    # Current mc2 operators only perform communication space partitioning
     # based on HCCL_BUFFSIZE configuration. Using pg_options with mc2 group would
     # result in memory misalignment problems.
     if group_name and "mc2" in group_name:
@@ -1477,7 +1611,7 @@ def calc_split_factor(num_list: list[int]):
     return [total / num for num in num_list]
 
 
-# NOTE: The last two dimensions of ND are transferred to NZ
+# The last two dimensions of ND are transferred to NZ
 def trans_nd_to_nz(cache_tensor: torch.Tensor):
     assert len(cache_tensor.shape) >= 2
     batch = cache_tensor.shape[:-2]
@@ -1507,7 +1641,22 @@ def parse_layer_idx(prefix: str) -> int | None:
     match = re.search(r"layers\.(\d+)", prefix)
     return int(match.group(1)) if match else None
 
-
+#SECTION
+#NOTE - get_compressed_pos_and_indices
+# 根据每个request历史token和本轮调度token，计算本轮新产生的compress_kv以及写入block的位置
+# 举个例子：
+# num_computed_tokens=[5,0] num_scheduled_tokens=[1,1216] 代表两个请求，第一个有5个历史token，本轮decode 1个；第二个有0个历史token，本轮prefill 1216个。
+# arrange_np=[0,1] 表示request row index
+# use_compress=True 表示启用DSA compressed cache
+# kv_cache_groups 表示当前的KVCacheGroupSpec
+# kv_cache_groups[0].layer_names=['model.layers.2.self_attn.indexer.k_cache', 'model.layers.2.self_attn.attn']
+# kv_cache_groups[1].layer_names=['model.layers.0.self_attn.swa_cache', 'model.layers.1.self_attn.swa_cache', 'model.layers.2.self_attn.swa_cache']
+# kv_cache_groups[2].layer_names=['model.layers.2.self_attn.compressor.state_cache', 'model.layers.2.self_attn.indexer.compressor.state_cache']
+# 三组分别对应C4A、SWA、state cache（压缩前token粒度）
+# 返回值有3个（注释旧了，不准确）
+# positions_compressed_list，每个KV group一份flattened压缩token positions
+# req_indices_compressed_list，形状同返回值1，标注每个token position所属的request index
+# num_scheduled_tokens_compressed_list，类似返回值2，统计每个request index的压缩token数
 def get_compressed_pos_and_indices(
     num_computed_tokens: np.ndarray,
     num_scheduled_tokens: np.ndarray,
@@ -1544,8 +1693,12 @@ def get_compressed_pos_and_indices(
 
     from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
 
+    
     for kv_cache_group_id, kv_cache_group_spec in enumerate(kv_cache_groups):
         # Calculate compressed length of historical & total tokens
+        #NOTE - 1. 计算压缩tokens的数量
+        # 1. 遍历和寻找kv cache spec，拿到compress_ratio 
+        # 2. 计算压缩后的历史tokens数和本轮执行后的总tokens数，相减得到本轮产生的压缩tokens数
         if isinstance(kv_cache_group_spec.kv_cache_spec, UniformTypeKVCacheSpecs):
             kv_cache_spec = next(iter(kv_cache_group_spec.kv_cache_spec.kv_cache_specs.values()))
         else:
@@ -1561,21 +1714,35 @@ def get_compressed_pos_and_indices(
             compressed_total_len = num_computed_tokens + num_scheduled_tokens
 
         # The number of new compressed position ids for each request
+        #ANCHOR - 返回值num_scheduled_tokens_compressed_list
+        # 本轮新压缩tokens的数量，flatten batch格式
         num_new_compressed_pos = compressed_total_len - compressed_historical_len
 
         # Core vectorized calculation (no for-loop)
+        #NOTE - 2. 计算压缩tokens位置
+        # 例子
+        # 假设num_new_compressed_pos=[3, 2]，代表2个请求的新压缩tokens分别有3、2个
+        # prefix_offsets表示在flatten batch里，每个请求新的压缩token的起始位置
+        # prefix_offsets=[0, 3]，表示第1个请求的压缩token从0开始，第二个请求从3开始，（cumsum是累加和）
         pos_starts = compressed_historical_len
         prefix_offsets = np.concatenate([[0], np.cumsum(num_new_compressed_pos[:-1])])
+        # 假设pos_starts=[10, 100]，代表2个请求的历史tokens数量，也是新压缩token在2个请求的起始位置
+        #ANCHOR - 返回值positions_compressed_list
+        # compressed_pos_ids=[10, 11, 12, 100, 101]，得到flatten batch里，每个压缩token的位置
         compressed_pos_ids = np.arange(np.sum(num_new_compressed_pos)) + np.repeat(
             pos_starts - prefix_offsets, num_new_compressed_pos
         )
 
+        #ANCHOR - 返回值req_indices_compressed_list
+        # req_indices_compressed=[0, 0, 0, 1, 1]，用于标识flatten batch里token所属的请求
         req_indices_compressed = np.repeat(arrange_np, num_new_compressed_pos)
+        # 返回值1和2：每组kv_group单独保存压缩token的位置和请求索引，compressed_pos_ids和req_indices_compressed
         req_indices_compressed_list.append(req_indices_compressed)
         positions_compressed_list.append(compressed_pos_ids)
+        # 返回值3：每组kv_group单独保存压缩token的数量
         num_scheduled_tokens_compressed_list.append(num_new_compressed_pos)
     return positions_compressed_list, req_indices_compressed_list, num_scheduled_tokens_compressed_list
-
+#!SECTION
 
 def kv_cache_spec_uses_sparse_c8(kv_cache_spec) -> bool:
     from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec

@@ -84,6 +84,7 @@ from vllm_ascend.utils import (
     get_ascend_device_type,
     get_dsv4_compress_ratio,
 )
+from vllm_ascend.patch.worker.patch_deepseek_compressor import AscendDeepseekV4IndexerLocalCache
 
 
 def _get_ascend_dsa_backend():
@@ -560,6 +561,9 @@ class Indexer(nn.Module):
         ascend_device_type = get_ascend_device_type()
         k_dtype = torch.float8_e4m3fn if ascend_device_type == AscendDeviceType.A5 else torch.int8
 
+        ascend_config = get_ascend_config()
+        self.enable_local_k_cache = ascend_config.enable_local_k_cache
+
         if self.compress_ratio == 4:
             # TODO(cmq): change the dtype of cache
             self.k_cache = AscendDeepseekV4IndexerCache(
@@ -569,6 +573,16 @@ class Indexer(nn.Module):
                 cache_config=cache_config,
                 compress_ratio=self.compress_ratio,
             )
+            
+            if self.enable_local_k_cache:
+                self.local_k_cache = AscendDeepseekV4IndexerLocalCache(
+                    head_dim=self.head_dim,
+                    dtype=k_dtype,
+                    prefix=f"{prefix}.local_k_cache",
+                    cache_config=cache_config,
+                    compress_ratio=self.compress_ratio,
+                )
+
         self.compressor = None
         if self.compress_ratio > 1:
             self.compressor = Compressor(
