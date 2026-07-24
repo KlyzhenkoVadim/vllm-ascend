@@ -116,6 +116,10 @@ class AscendDeepseekSparseAttention(MultiHeadLatentAttentionWrapper):
         self.index_topm = dsa_modules.index_topm
         self.micro_step_num = dsa_modules.micro_step_num
 
+        from vllm_ascend.ascend_config import get_ascend_config
+        ascend_config = get_ascend_config()
+        self.enable_local_k_cache = ascend_config.enable_local_k_cache
+
         self.swa_cache_layer = dsa_modules.swa_cache_layer
 
         self.dsa_attn = DSAAttention(
@@ -239,6 +243,8 @@ def _build_kv_cache(self, forward_context):
     indexer_k_cache = None
     indexer_scale_cache = None
     indexer_full_cache = None
+    indexer_local_k_cache = None
+    indexer_local_scale_cache = None
 
     if self.compress_ratio > 1:
         state_cache = self.compressor.state_cache.kv_cache
@@ -259,37 +265,24 @@ def _build_kv_cache(self, forward_context):
                 self.indexer.k_cache.kv_cache[0][0],
                 self.indexer.k_cache.kv_cache[0][1],
             )
+        if self.enable_local_k_cache:
+            indexer_local_k_cache, indexer_local_scale_cache = (
+                self.indexer.local_k_cache.kv_cache[0][0],
+                self.indexer.local_k_cache.kv_cache[0][1],
+            )
 
-    if get_ascend_device_type() in {AscendDeviceType.A5}:
-        kv_cache = tuple(
-            [
-                unfold_kvcache(cache)
-                for cache in (
-                    compress_kv_cache,
-                    swa_kv_cache,
-                    state_cache,
-                    indexer_state_cache,
-                    indexer_k_cache,
-                    indexer_scale_cache,
-                    indexer_full_cache,
-                )
-            ]
-        )
-    else:
-        kv_cache = tuple(
-            [
-                unfold_kvcache(cache)
-                for cache in (
-                    compress_kv_cache,
-                    swa_kv_cache,
-                    state_cache,
-                    indexer_state_cache,
-                    indexer_k_cache,
-                    indexer_scale_cache,
-                )
-            ]
-        )
-    return kv_cache
+    cache_entries = (
+        [(compress_kv_cache, swa_kv_cache, state_cache, indexer_state_cache,
+          indexer_k_cache, indexer_scale_cache, indexer_full_cache)]
+        if get_ascend_device_type() in {AscendDeviceType.A5}
+        else [(compress_kv_cache, swa_kv_cache, state_cache, indexer_state_cache,
+               indexer_k_cache, indexer_scale_cache)]
+    )
+
+    if self.enable_local_k_cache:
+        cache_entries[0] = cache_entries[0] + (indexer_local_k_cache, indexer_local_scale_cache)
+
+    return tuple(unfold_kvcache(cache) for cache in cache_entries[0])
 
 
 def unfold_kvcache(kvcache):

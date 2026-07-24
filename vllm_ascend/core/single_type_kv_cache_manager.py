@@ -312,7 +312,7 @@ class FixedCacheManager(SingleTypeKVCacheManager):
         assert self.dcp_world_size == 1
         assert self.pcp_world_size == 1
         self.compress_ratio = kv_cache_spec.compress_ratio
-        self.fixed_token_lengths = kv_cache_spec.fixed_cache_lengths
+        self.fixed_token_lengths = kv_cache_spec.fixed_token_lengths
         self.num_fixed_blocks = self.fixed_token_lengths // self.block_size
 
     def get_num_blocks_to_allocate(

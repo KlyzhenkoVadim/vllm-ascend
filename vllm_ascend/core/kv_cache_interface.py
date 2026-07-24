@@ -255,11 +255,11 @@ class FixedCacheSpec(AscendMLAAttentionSpec):
     and never expanded.
     """
 
-    fixed_cache_lengths: int = 2048  # tokens worth of fixed cache per request
+    fixed_token_lengths: int = 2048  # tokens worth of fixed cache per request
 
     @property
     def num_fixed_blocks(self) -> int:
-        return cdiv(self.fixed_cache_lengths, self.storage_block_size)
+        return cdiv(self.fixed_token_lengths, self.storage_block_size)
 
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         return self.num_fixed_blocks * self.page_size_bytes
@@ -269,10 +269,10 @@ class FixedCacheSpec(AscendMLAAttentionSpec):
         assert all(isinstance(spec, FixedCacheSpec) for spec in specs), (
             "All attention layers in the same KV cache group must be FixedCacheSpec."
         )
-        fixed_lengths_set = set(spec.fixed_cache_lengths for spec in specs)
+        fixed_lengths_set = set(spec.fixed_token_lengths for spec in specs)
         assert len(fixed_lengths_set) == 1, (
             "All attention layers in the same KV cache group must use "
-            "the same fixed_cache_lengths."
+            "the same fixed_token_lengths."
         )
         return cls(
             block_size=specs[0].block_size,
@@ -283,7 +283,7 @@ class FixedCacheSpec(AscendMLAAttentionSpec):
             cache_dtype_str=specs[0].cache_dtype_str,
             compress_ratio=specs[0].compress_ratio,
             model_version=specs[0].model_version,
-            fixed_cache_lengths=fixed_lengths_set.pop(),
+            fixed_token_lengths=fixed_lengths_set.pop(),
         )
 
 
