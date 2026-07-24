@@ -15,6 +15,7 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     SlidingWindowMLASpec,
     UniformTypeKVCacheSpecs,
+    FixedCacheSpec,
 )
 
 _orig_resolve_kv_cache_block_sizes = vllm.v1.core.kv_cache_utils.resolve_kv_cache_block_sizes
@@ -70,11 +71,23 @@ def group_and_unify_kv_cache_specs(
 
     ratio_specs: dict[int, dict[str, KVCacheSpec]] = defaultdict(dict)
     grouped_swa_mla_specs: dict[int, dict[str, KVCacheSpec]] = defaultdict(dict)
-    for name, spec in kv_cache_spec.items():
-        if isinstance(spec, SlidingWindowMLASpec):
-            grouped_swa_mla_specs[spec.block_size][name] = spec
-        elif isinstance(spec, MLAAttentionSpec):
-            ratio_specs[spec.compress_ratio][name] = spec
+
+    if not any(isinstance(spec, FixedCacheSpec) for spec in kv_cache_spec.values()):
+        for name, spec in kv_cache_spec.items():
+            if isinstance(spec, SlidingWindowMLASpec):
+                grouped_swa_mla_specs[spec.block_size][name] = spec
+            elif isinstance(spec, MLAAttentionSpec):
+                ratio_specs[spec.compress_ratio][name] = spec
+    else:
+        fixed_cache_specs: dict[int, dict[str, KVCacheSpec]] = defaultdict(dict)
+        for name, spec in kv_cache_spec.items():
+            if isinstance(spec, SlidingWindowMLASpec):
+                grouped_swa_mla_specs[spec.block_size][name] = spec
+            elif isinstance(spec, MLAAttentionSpec):
+                ratio_specs[spec.compress_ratio][name] = spec
+            elif isinstance(spec, FixedCacheSpec):
+                fixed_cache_specs[spec.compress_ratio][name] = spec
+    
 
     mla_uniform_specs = []
     for ratio in sorted(ratio_specs, key=lambda r: (r != 4, r)):
@@ -88,6 +101,17 @@ def group_and_unify_kv_cache_specs(
         uniform_spec = UniformTypeKVCacheSpecs.from_specs(spec_dict)
         assert uniform_spec is not None
         swa_uniform_specs.append(uniform_spec)
+
+    if any(isinstance(spec, FixedCacheSpec) for spec in kv_cache_spec.values()):
+        fixed_cache_uniform_specs = []
+        if fixed_cache_specs:
+            for spec_dict in fixed_cache_specs.values():
+                fixed_cache_uniform_spec = UniformTypeKVCacheSpecs.from_specs(spec_dict)
+                assert fixed_cache_uniform_spec is not None
+                fixed_cache_uniform_specs.append(fixed_cache_uniform_spec)
+
+        return [*mla_uniform_specs, *fixed_cache_uniform_specs, *swa_uniform_specs]
+
 
     return [*mla_uniform_specs, *swa_uniform_specs]
 
@@ -114,6 +138,15 @@ def _get_kv_cache_groups_uniform_groups(
         kv_cache_spec=full_mla_c128_spec,
     )
 
+    swa_mla_start_idx = 2
+    if len(grouped_specs) > 5:
+        swa_mla_start_idx = 3
+        fixed_cache_spec = grouped_specs[2]
+        fixed_cache_group = KVCacheGroupSpec(
+            layer_names=list(fixed_cache_spec.kv_cache_specs.keys()),
+            kv_cache_spec=fixed_cache_spec,
+        )
+
     # We define a layer tuple as a group of layers with different page sizes, and
     # one UniformTypeKVCacheSpecs contains a list of layer tuples.
     # For example, if we have 11 C4 layers and 10 C128 layers, we can define a layer
@@ -128,7 +161,7 @@ def _get_kv_cache_groups_uniform_groups(
     num_layer_tuples_per_group = [round_up(x, num_layer_tuples) for x in num_layer_tuples_per_group]
 
     # TODO(cmq): this is not general enough
-    swa_mla_specs = grouped_specs[2:]
+    swa_mla_specs = grouped_specs[swa_mla_start_idx:]
 
     assert all(
         isinstance(spec, SlidingWindowMLASpec) for group in swa_mla_specs for spec in group.kv_cache_specs.values()
@@ -180,6 +213,9 @@ def _get_kv_cache_groups_uniform_groups(
                     kv_cache_spec=sub_sm_spec,
                 )
             )
+    
+    if len(grouped_specs) > 5:
+        return [full_mla_group, full_mla_c128_group, fixed_cache_group, *swa_mla_groups]
 
     return [full_mla_group, full_mla_c128_group, *swa_mla_groups]
 

@@ -278,6 +278,12 @@ class AscendConfig:
         self.mix_placement = additional_config.get("mix_placement", False)
         self._check_mix_placement()
 
+        self.enable_local_k_cache = additional_config.get("enable_local_k_cache", False)
+        self.indexcache_anchor_interval = additional_config.get("indexcache_anchor_interval", 4)
+        self.indexcache_topm = additional_config.get("indexcache_topm", 2048)
+        self.indexcache_prefill_topm = additional_config.get("indexcache_prefill_topm", 16384)
+        self.indexcache_buffer_len = additional_config.get("indexcache_buffer_len", 16384)
+
         self.hamming_sparse = additional_config.get("hamming_sparse", {"enabled": False, "sparse_json_location": ""})
         self.enable_hamming_sparse = self.hamming_sparse["enabled"]
         self.sparse_json = self.hamming_sparse["sparse_json_location"]

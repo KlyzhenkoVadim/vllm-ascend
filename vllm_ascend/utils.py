@@ -638,7 +638,7 @@ def dispose_tensor(x: torch.Tensor):
 def register_ascend_customop(vllm_config: VllmConfig | None = None):
     """Register Ascend CustomOP
 
-    NOTE: if the register branch requires model type, please use `vllm.config.get_current_vllm_config`,
+    if the register branch requires model type, please use `vllm.config.get_current_vllm_config`,
     and ensure this will execute after model config is initilazed.
     """
     global _ASCEND_CUSTOMOP_IS_REIGISTERED
@@ -761,7 +761,7 @@ def register_ascend_customop(vllm_config: VllmConfig | None = None):
     for name, op_cls in REGISTERED_ASCEND_OPS.items():
         CustomOp.register_oot(_decorated_op_cls=op_cls, name=name)
 
-    # NOTE: Keep this at last to ensure all custom actions are registered
+    # Keep this at last to ensure all custom actions are registered
     _ASCEND_CUSTOMOP_IS_REIGISTERED = True
 
 
@@ -873,7 +873,7 @@ def enable_sp(vllm_config=None, enable_shared_expert_dp: bool = False) -> bool:
     return bool(_ENABLE_SP)
 
 
-# TODO remove it after vllm has this func
+# remove it after vllm has this func
 def shared_expert_dp_enabled() -> bool:
     return get_ascend_config().enable_shared_expert_dp or enable_sp() or enable_sp_by_pass()
 
@@ -1050,7 +1050,7 @@ def get_hccl_config_for_pg_options(group_name: str) -> dict | None:
     Returns:
         HCCL pg_options or None for mc2 group
     """
-    # FIXME: Current mc2 operators only perform communication space partitioning
+    # Current mc2 operators only perform communication space partitioning
     # based on HCCL_BUFFSIZE configuration. Using pg_options with mc2 group would
     # result in memory misalignment problems.
     if group_name and "mc2" in group_name:
@@ -1477,7 +1477,7 @@ def calc_split_factor(num_list: list[int]):
     return [total / num for num in num_list]
 
 
-# NOTE: The last two dimensions of ND are transferred to NZ
+# The last two dimensions of ND are transferred to NZ
 def trans_nd_to_nz(cache_tensor: torch.Tensor):
     assert len(cache_tensor.shape) >= 2
     batch = cache_tensor.shape[:-2]
@@ -1507,7 +1507,22 @@ def parse_layer_idx(prefix: str) -> int | None:
     match = re.search(r"layers\.(\d+)", prefix)
     return int(match.group(1)) if match else None
 
-
+#SECTION
+#NOTE - get_compressed_pos_and_indices
+# 根据每个request历史token和本轮调度token，计算本轮新产生的compress_kv以及写入block的位置
+# 举个例子：
+# num_computed_tokens=[5,0] num_scheduled_tokens=[1,1216] 代表两个请求，第一个有5个历史token，本轮decode 1个；第二个有0个历史token，本轮prefill 1216个。
+# arrange_np=[0,1] 表示request row index
+# use_compress=True 表示启用DSA compressed cache
+# kv_cache_groups 表示当前的KVCacheGroupSpec
+# kv_cache_groups[0].layer_names=['model.layers.2.self_attn.indexer.k_cache', 'model.layers.2.self_attn.attn']
+# kv_cache_groups[1].layer_names=['model.layers.0.self_attn.swa_cache', 'model.layers.1.self_attn.swa_cache', 'model.layers.2.self_attn.swa_cache']
+# kv_cache_groups[2].layer_names=['model.layers.2.self_attn.compressor.state_cache', 'model.layers.2.self_attn.indexer.compressor.state_cache']
+# 三组分别对应C4A、SWA、state cache（压缩前token粒度）
+# 返回值有3个（注释旧了，不准确）
+# positions_compressed_list，每个KV group一份flattened压缩token positions
+# req_indices_compressed_list，形状同返回值1，标注每个token position所属的request index
+# num_scheduled_tokens_compressed_list，类似返回值2，统计每个request index的压缩token数
 def get_compressed_pos_and_indices(
     num_computed_tokens: np.ndarray,
     num_scheduled_tokens: np.ndarray,
@@ -1544,8 +1559,12 @@ def get_compressed_pos_and_indices(
 
     from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
 
+    
     for kv_cache_group_id, kv_cache_group_spec in enumerate(kv_cache_groups):
         # Calculate compressed length of historical & total tokens
+        #NOTE - 1. 计算压缩tokens的数量
+        # 1. 遍历和寻找kv cache spec，拿到compress_ratio 
+        # 2. 计算压缩后的历史tokens数和本轮执行后的总tokens数，相减得到本轮产生的压缩tokens数
         if isinstance(kv_cache_group_spec.kv_cache_spec, UniformTypeKVCacheSpecs):
             kv_cache_spec = next(iter(kv_cache_group_spec.kv_cache_spec.kv_cache_specs.values()))
         else:

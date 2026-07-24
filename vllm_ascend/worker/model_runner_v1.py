@@ -109,6 +109,7 @@ from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBui
 from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder
 from vllm_ascend.attention.mla_v1 import AscendMLABackend
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, using_paged_attention
+from vllm_ascend.indexcache import IndexCacheDecodeMode
 
 # yapf conflicts with isort for this block
 # yapf: disable
@@ -252,7 +253,6 @@ class ExecuteModelState(NamedTuple):
     cudagraph_stats: CUDAGraphStat | None
     batch_desc: BatchDescriptor
 
-
 class NPUModelRunner(GPUModelRunner):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         # TODO(qcs): These manual pad and unpad for GPUModelRunner are
@@ -300,7 +300,7 @@ class NPUModelRunner(GPUModelRunner):
         # Now, query_start_loc is padded.
         # But gdn needs an unpadded one.
         # gdn_query_start_loc is an unpadded version of query_start_loc.
-        # TODO delete it if fia's check is removed.
+        # delete it if fia's check is removed.
         self._has_gdn = check_gdn_layer(vllm_config)
         self._has_sinks = False
         if self._has_gdn:
@@ -317,9 +317,15 @@ class NPUModelRunner(GPUModelRunner):
 
         self.sampler = AscendSampler()
         self.attn_state: AscendAttentionState | None = None
+        #ANCHOR - Token-level IndexCache 变量初始化
+        self.indexcache_last_anchor_pos: dict[str, int] = {}    # req_id -> token position. anchor/non-anchor是请求级状态
+        self.indexcache_decode_cur_pos: dict[str, int] = {}
+        self.indexcache_decode_is_anchor: dict[str, bool] = {}  # req_id -> True/False
+        self.indexcache_batch_decode_mode = IndexCacheDecodeMode.DISABLED
 
         # Ascend-specific configurations
         self.ascend_config = get_ascend_config()
+        self.indexcache_anchor_interval = self.ascend_config.indexcache_anchor_interval
         set_weight_prefetch_method(self.ascend_config.weight_prefetch_config)
         # Dump / PrecisionDebugger configuration now comes from AscendConfig
         dump_cfg = self.ascend_config.dump_config_path
@@ -657,11 +663,11 @@ class NPUModelRunner(GPUModelRunner):
         cudagraph_mode: CUDAGraphMode = CUDAGraphMode.NONE,
         allow_dp_padding: bool = False,
     ) -> tuple[int, torch.Tensor | None, CUDAGraphMode]:
-        # TODO: In vLLM, the only thing that needs to be synced is num_tokens, but in
+        # In vLLM, the only thing that needs to be synced is num_tokens, but in
         # our case, we still need to sync the other two flags as well. So we need to
         # include them in the all_reduce operation, and more over, we CANNOT skip it
         # even if we are running in eager mode, which harms performance.
-        # FIXME: Restore the `or self.vllm_config.model_config.enforce_eager` here
+        # Restore the `or self.vllm_config.model_config.enforce_eager` here
         # immediately once the other two flags are no longer needed.
         if self.dp_size == 1:
             return num_tokens, None, cudagraph_mode
@@ -735,7 +741,7 @@ class NPUModelRunner(GPUModelRunner):
         This function is only designed to satisfied the constraint that when the layout is TND,
         the first dimension of `hidden_states` must equal the last element of `actual_seq_lengths_q`.
         """
-        # TODO: need refactor later, related to vllm PR #34043 this pr delete func
+        # need refactor later, related to vllm PR #34043 this pr delete func
         # relax_for_mixed_batch_cudagraphs, num_reqs no longer equals the actual number of requests.
         if cudagraph_runtime_mode == CUDAGraphMode.FULL and \
             self.compilation_config.cudagraph_mode == CUDAGraphMode.FULL:
@@ -771,6 +777,7 @@ class NPUModelRunner(GPUModelRunner):
 
         return num_reqs_padded
 
+    #SECTION - prepare_inputs
     def _prepare_inputs(
         self,
         scheduler_output: "SchedulerOutput",
@@ -961,7 +968,7 @@ class NPUModelRunner(GPUModelRunner):
         # Now, query_start_loc is padded.
         # But gdn needs an unpadded one.
         # gdn_query_start_loc is an unpadded version of query_start_loc.
-        # TODO delete it if fia's check is removed.
+        # delete it if fia's check is removed.
         if self._has_gdn:
             self.gdn_query_start_loc.np[0] = 0
             self.gdn_query_start_loc.np[1 : num_reqs + 1] = cu_num_tokens
@@ -1259,6 +1266,12 @@ class NPUModelRunner(GPUModelRunner):
             self.kv_cache_config.kv_cache_groups)
         # For non-PCP, compute slot_mapping on GPU. PCP slot_mapping was
         # already computed on GPU before PCP split the positions.
+        #NOTE - compute_slot_mapping
+        #LINK - /vllm-workspace/vllm-ascend/vllm_ascend/worker/block_table.py:230
+        # 模型推理前准备slot_mapping：req_indices和positions_compressed_list反映本轮调度是否有新的compressed token
+        # 如果无新的compressed token，req_indices.shape[0]==0，不会分配slot_mapping
+        #LINK - /vllm-workspace/vllm-ascend/vllm_ascend/attention/dsa_v1.py:940
+        # 模型推理时，每轮推理实时计算每个token是否在压缩边界，是否形成压缩token，是否需要写slot_mapping
         if self.pcp_size <= 1:
             self.input_batch.block_table.compute_slot_mapping(
                 num_reqs,
@@ -1281,7 +1294,7 @@ class NPUModelRunner(GPUModelRunner):
             # partial requests. While we should not sample any token
             # from these partial requests, we do so for simplicity.
             # We will ignore the sampled tokens from the partial requests.
-            # TODO: Support prompt logprobs.
+            # Support prompt logprobs.
             spec_decode_metadata = None
             num_draft_tokens = None
             num_sampled_tokens = np.ones(num_reqs, dtype=np.int32)
@@ -1519,7 +1532,7 @@ class NPUModelRunner(GPUModelRunner):
             attn_state = AscendAttentionState.PrefillCacheHit
 
         # For the overlay of the PCP feature and the eagle3, attn_state needs to be recovered
-        # TODO: Resolved the conflict between the sunset of attn_state and the PCP that requires this interface.
+        # Resolved the conflict between the sunset of attn_state and the PCP that requires this interface.
         if attn_state == AscendAttentionState.SpecDecoding and self.speculative_config.method != "mtp":
             self.attn_state = AscendAttentionState.ChunkedPrefill  # type: ignore
         else:
@@ -1609,7 +1622,7 @@ class NPUModelRunner(GPUModelRunner):
         # [0, 1, 2, 5, 6, 9]
         target_logits_indices += arange
 
-        # TODO: Optimize the CPU -> NPU copy.
+        # Optimize the CPU -> NPU copy.
         cu_num_draft_tokens = torch.from_numpy(cu_num_draft_tokens).pin_memory().to(self.device, non_blocking=True)
         cu_num_sampled_tokens = torch.from_numpy(cu_num_sampled_tokens).pin_memory().to(self.device, non_blocking=True)
         logits_indices = torch.from_numpy(logits_indices).pin_memory().to(self.device, non_blocking=True)
@@ -1682,7 +1695,7 @@ class NPUModelRunner(GPUModelRunner):
             self.valid_sampled_token_count_gpu = valid_sampled_tokens_count # type: ignore[no-redef]
         self.input_batch.prev_sampled_token_ids = next_token_ids.unsqueeze(1)
 
-    # TODO: Once the PCP features are complete, it will fully inherit the classes from the VLLM community.
+    # Once the PCP features are complete, it will fully inherit the classes from the VLLM community.
     def propose_draft_token_ids(
         self,
         valid_sampled_token_ids: torch.Tensor | list[list[int]],
@@ -1865,7 +1878,7 @@ class NPUModelRunner(GPUModelRunner):
                     assert common_attn_metadata is not None
                     common_attn_metadata.query_start_loc[: num_reqs + 1] = query_start_loc_pcp_full[: num_reqs + 1]
                 if self.vllm_config.speculative_config.disable_padded_drafter_batch:
-                    # NOTE: Currently, MTP-fullgraph is incompatibility with pcp
+                    # Currently, MTP-fullgraph is incompatibility with pcp
                     token_indices_to_sample = None
                     assert self.drafter is not None
                     common_attn_metadata, token_indices = self.drafter.prepare_inputs(
@@ -1944,6 +1957,7 @@ class NPUModelRunner(GPUModelRunner):
                 self.draft_token_ids_cpu[:num_reqs] = 0
             self.draft_token_ids_event.record()
 
+    #SECTION - execute_model
     @torch.inference_mode()
     def execute_model(
         self,
@@ -1995,7 +2009,7 @@ class NPUModelRunner(GPUModelRunner):
         if ((
             self.use_async_scheduling and self.num_spec_tokens and self._draft_token_ids is None  # type: ignore[has-type]
         ) or (
-            # NOTE: This branch specifically triggers a deepcopy during the prefill phase 
+            # This branch specifically triggers a deepcopy during the prefill phase 
             # only for PCP (Parallel Context Processing) + Multi-Modal (MM) scenarios. 
             # It does not affect other use cases. This is a temporary workaround and 
             # will be removed once upstream vLLM provides native support for PCP + MM.
@@ -2220,6 +2234,32 @@ class NPUModelRunner(GPUModelRunner):
                         num_tokens_padded, num_reqs_padded, num_reqs, cudagraph_mode, batch_desc.num_reqs
                     )
 
+                self.indexcache_decode_cur_pos.clear()
+                self.indexcache_decode_is_anchor.clear()
+                if not self.ascend_config.enable_local_k_cache:
+                    indexcache_batch_decode_mode = IndexCacheDecodeMode.DISABLED
+                else:
+                    computed_tokens = self.input_batch.num_computed_tokens_cpu[:num_reqs]
+                    for req_index in range(num_reqs):
+                        req_id = req_ids[req_index]
+                        is_normal_decode = (computed_tokens[req_index] and num_scheduled_tokens_np[req_index] == 1)
+                        if not is_normal_decode:
+                            continue
+                        last_anchor_pos = self.indexcache_last_anchor_pos.setdefault(req_id, -1)
+                        cur_pos = computed_tokens[req_index]
+                        is_anchor = (last_anchor_pos < 0 or cur_pos - last_anchor_pos >= self.indexcache_anchor_interval)
+                        self.indexcache_decode_cur_pos[req_id] = cur_pos
+                        self.indexcache_decode_is_anchor[req_id] = is_anchor
+                    if len(self.indexcache_decode_is_anchor) == 0:
+                        indexcache_batch_decode_mode = IndexCacheDecodeMode.DISABLED
+                    elif any(self.indexcache_decode_is_anchor.values()):
+                        indexcache_batch_decode_mode = IndexCacheDecodeMode.ANCHOR
+                    else:
+                        indexcache_batch_decode_mode = IndexCacheDecodeMode.REUSE
+
+                indexcache_batch_req_ids = tuple(req_ids[:num_reqs])
+
+                #NOTE - build_attention_metadata
                 (attn_metadata, spec_decode_common_attn_metadata) = self._build_attention_metadata(
                     num_tokens=num_tokens_unpadded
                     if not (self.use_cp and self.pcp_manager.pcp_use_hybrid_attn)
@@ -2235,6 +2275,8 @@ class NPUModelRunner(GPUModelRunner):
                     num_scheduled_tokens_np=num_scheduled_tokens_np,
                     cascade_attn_prefix_lens=cascade_attn_prefix_lens,
                     num_scheduled_tokens_compressed_list=num_scheduled_tokens_compressed_list,
+                    indexcache_batch_decode_mode=indexcache_batch_decode_mode,
+                    indexcache_batch_req_ids=indexcache_batch_req_ids,
                 )
 
                 self._sanitize_placeholder_input_ids_for_forward(
@@ -2313,6 +2355,9 @@ class NPUModelRunner(GPUModelRunner):
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
+            if self.indexcache_batch_decode_mode is IndexCacheDecodeMode.ANCHOR:
+                for req_id, cur_pos in self.indexcache_decode_cur_pos.items():
+                    self.indexcache_last_anchor_pos[req_id] = cur_pos
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs:
@@ -2392,6 +2437,7 @@ class NPUModelRunner(GPUModelRunner):
         if deferred_state_corrections_fn:
             deferred_state_corrections_fn()
         return None
+    #!SECTION
 
     @torch.inference_mode()
     def sample_tokens(
@@ -2634,7 +2680,7 @@ class NPUModelRunner(GPUModelRunner):
         )
         return sampler_output
 
-    # TODO: remove this func after eagle_proposer is refactored and
+    # remove this func after eagle_proposer is refactored and
     #  _bookkeeping_sync is moved after propose_draft_token_ids
     def _bookkeeping_sync(
         self,
@@ -2652,7 +2698,7 @@ class NPUModelRunner(GPUModelRunner):
         dict[str, int],
         list[int],
     ]:
-        # TODO: implement PR 28597 from vllm
+        # implement PR 28597 from vllm
         discard_sampled_tokens_req_indices = self.discard_request_indices.np[: self.num_discarded_requests]
         for i in discard_sampled_tokens_req_indices:
             gen = self.input_batch.generators.get(int(i))
@@ -3015,6 +3061,7 @@ class NPUModelRunner(GPUModelRunner):
             cudagraph_stats,
         )
 
+    #SECTION - build_attention_metadata
     def _build_attention_metadata(
         self,
         num_tokens: int,
@@ -3030,6 +3077,9 @@ class NPUModelRunner(GPUModelRunner):
         num_scheduled_tokens_np: np.ndarray | None = None,
         cascade_attn_prefix_lens: list[list[int]] | None = None,
         num_scheduled_tokens_compressed_list: list[np.ndarray] | None = None,
+        #ANCHOR - 函数签名增加indexcache相关参数
+        indexcache_batch_decode_mode: IndexCacheDecodeMode = IndexCacheDecodeMode.DISABLED,
+        indexcache_batch_req_ids: tuple[str, ...] | None = None,
     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
         """
         :return: tuple[attn_metadata, spec_decode_common_attn_metadata]
@@ -3150,6 +3200,7 @@ class NPUModelRunner(GPUModelRunner):
             total_num_scheduled_tokens_compressed_list = None
             num_reqs_actual = num_reqs
 
+        #NOTE - get_block_table_and_slot_mapping
         block_table_gid_0, slot_mapping_gid_0 = _get_block_table_and_slot_mapping(
             0, total_num_scheduled_tokens_compressed_list)  # type: ignore[arg-type]
         self.long_seq_metadata, block_table_gid_0 = _get_pcp_metadata(block_table_gid_0)
@@ -3167,6 +3218,8 @@ class NPUModelRunner(GPUModelRunner):
             seq_lens_cpu = None
             num_computed_tokens_cpu = None
 
+        #NOTE - 构造cm_base - AscendCommonAttentionMetadata
+        # 公共metadata
         cm_base = AscendCommonAttentionMetadata(
             query_start_loc=self.query_start_loc.gpu[: num_reqs_padded + 1],
             query_start_loc_cpu=self.query_start_loc.cpu[: num_reqs_padded + 1],
@@ -3177,9 +3230,7 @@ class NPUModelRunner(GPUModelRunner):
             # proposer checks to distinguish async/non-async behavior.
             _seq_lens_cpu=self.optimistic_seq_lens_cpu[:num_reqs_padded],
             seq_lens_cpu_upper_bound=self.optimistic_seq_lens_cpu[:num_reqs_padded],
-            # TODO
             seq_lens_cpu=seq_lens_cpu,
-            # TODO
             # num_computed_tokens_cpu=self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs_padded],
             num_computed_tokens_cpu=num_computed_tokens_cpu,
             num_reqs=num_reqs_padded,
@@ -3204,6 +3255,7 @@ class NPUModelRunner(GPUModelRunner):
             cm_base.num_logits_indices = logits_indices.size(0)
             cm_base.logits_indices_padded = self._prepare_kv_sharing_fast_prefill(logits_indices)
 
+        #SECTION - _build_attn_group_metadata - common metadata转为特定模型的metadata
         def _build_attn_group_metadata(
             kv_cache_gid: int,
             attn_gid: int,
@@ -3237,6 +3289,11 @@ class NPUModelRunner(GPUModelRunner):
                         decode_ratio_to_sas_metadata=dict(),
                         common_ratio_to_sas_metadata=dict(),
                         block_size=attn_group.kv_cache_spec.block_size,
+                        #ANCHOR - for_cudagraph_capture请求，构造metadata，将indexcache相关变量传入AscendDSAMetadataBuilder
+                        # for_cudagraph_capture在engine初始化时warmup，基于dummy batch预先构造图
+                        # IndexCache暂不考虑图模式，相关变量设置为空
+                        indexcache_batch_decode_mode=IndexCacheDecodeMode.DISABLED,
+                        indexcache_batch_req_ids=None,
                         )
                 else:
                     extra_attn_metadata_args = dict(
@@ -3246,9 +3303,13 @@ class NPUModelRunner(GPUModelRunner):
                         decode_ratio_to_sas_metadata=decode_ratio_to_sas_metadata,
                         common_ratio_to_sas_metadata=common_ratio_to_sas_metadata,
                         block_size=attn_group.kv_cache_spec.block_size,
+                        #ANCHOR - 真实请求，构造metadata，将indexcache相关变量传入AscendDSAMetadataBuilder
+                        indexcache_batch_decode_mode=indexcache_batch_decode_mode,
+                        indexcache_batch_req_ids=indexcache_batch_req_ids,
                         )
 
             # add kvcomp_metadata into common_attn_metadata
+            #NOTE - Build AscendDSAMetadata，用于DSA forward_decode/prefill
             if (for_cudagraph_capture
                     and not isinstance(builder, (AscendDSAMetadataBuilder, AscendDSACPMetadataBuilder))):
                 attn_metadata_i = builder.build_for_cudagraph_capture(common_attn_metadata)
@@ -3278,6 +3339,7 @@ class NPUModelRunner(GPUModelRunner):
 
             for layer_name in attn_group.layer_names:
                 attn_metadata_dict[layer_name] = attn_metadata_i
+        #!SECTION
 
         # Prepare the attention metadata for each KV cache group and make layers
         # in the same group share the same metadata.
@@ -3298,7 +3360,7 @@ class NPUModelRunner(GPUModelRunner):
             # Now, query_start_loc is padded.
             # But gdn needs an unpadded one.
             # gdn_query_start_loc is an unpadded version of query_start_loc.
-            # TODO delete it if fia's check is removed.
+            # delete it if fia's check is removed.
             if self._has_gdn:
                 attn_group = self.attn_groups[kv_cache_gid][0]
                 builder = attn_group.get_metadata_builder(0)
@@ -3319,6 +3381,7 @@ class NPUModelRunner(GPUModelRunner):
                 from vllm_ascend.attention.kvcomp_attn.attention_utils import build_kvcomp_metadata
                 build_kvcomp_metadata(self.kvcomp_meta_data, cm)
             for attn_gid in range(len(self.attn_groups[kv_cache_gid])):
+                #NOTE - cm写入实际模型的metadata
                 _build_attn_group_metadata(
                     kv_cache_gid, attn_gid, cm, num_reqs_actual,
                     prefill_ratio_to_sas_metadata, decode_ratio_to_sas_metadata,
@@ -3351,6 +3414,7 @@ class NPUModelRunner(GPUModelRunner):
             # padded attention metadata.
             spec_decode_common_attn_metadata = spec_decode_common_attn_metadata.unpadded(num_tokens, num_reqs)
         return attn_metadata, spec_decode_common_attn_metadata
+    #!SECTION
 
     def _should_build_dummy_attn_metadata(
         self,
@@ -3549,7 +3613,7 @@ class NPUModelRunner(GPUModelRunner):
             num_scheduled_tokens,
             num_sampled_tokens,
             remove_lora,
-            # TODO: The next line is a temporary workaround
+            # The next line is a temporary workaround
             # to fix the accuracy issue of test_llama32_lora.py,
             # which is introduced by vllm-project/vllm#32005
             num_active_loras=(self.lora_config.max_loras if self.lora_config is not None else num_active_loras),
@@ -3668,7 +3732,7 @@ class NPUModelRunner(GPUModelRunner):
         num_scheduled_tokens_list[-1] += self.max_num_tokens % self.max_num_reqs
         num_scheduled_tokens = np.array(num_scheduled_tokens_list, dtype=np.int32)
         logit_indices = np.cumsum(num_scheduled_tokens) - 1
-        # TODO: need to rum a dummy sampler for generate task
+        # need to rum a dummy sampler for generate task
         hidden_states = hidden_states[logit_indices]
         output = self.model.compute_logits(hidden_states)
         return output
@@ -3682,7 +3746,7 @@ class NPUModelRunner(GPUModelRunner):
             self._dummy_run(mc2_tokens_capacity, with_prefill=True, is_profile=True)
         origin_max_num_tokens = self.max_num_tokens
         # in the pcp scenario, the split sequence needs to be used for profile run
-        # TODO: after the vllm pcp function is launched, this logic needs to be brought up to the community
+        # after the vllm pcp function is launched, this logic needs to be brought up to the community
         if self.pcp_size > 1:
             self.max_num_tokens = math.ceil(self.max_num_tokens / (self.pcp_size * 2)) * 2
         super().profile_run()
@@ -3712,7 +3776,7 @@ class NPUModelRunner(GPUModelRunner):
         logger.info("Starting to load model %s...", self.model_config.model)
 
         if self.ascend_config.mix_placement:
-            # TODO: Enabling the mix placement in deepseek_v2.py
+            # Enabling the mix placement in deepseek_v2.py
             # remove this part after the mix placement merged into vllm
             def mock_true():
                 return True
@@ -3729,7 +3793,7 @@ class NPUModelRunner(GPUModelRunner):
             for name, _ in self.model.named_parameters():
                 # sinks is a kind of parameter in attention
                 # only set in weight name
-                # TODO: remove it when fia merge in fiav2
+                # remove it when fia merge in fiav2
                 if "sink" in name:
                     self._has_sinks = True
                     break
@@ -4063,7 +4127,7 @@ class NPUModelRunner(GPUModelRunner):
         Initializes the KV cache buffer with the correct size. The buffer needs
         to be reshaped to the desired shape before being used by the models.
 
-        NOTE: To support prefill disaggregation, we need to split kvcache tensor into
+        To support prefill disaggregation, we need to split kvcache tensor into
         k_cache and v cache, and the addr of both are aligned by 2M
 
         Args:
@@ -4124,7 +4188,7 @@ class NPUModelRunner(GPUModelRunner):
                         # shared the kvcache between the self_attn specs in the same group
                         kv_cache_raw_tensors[layer_name_inner] = tensor
                 elif "attn" in layer_name and layer_name not in kv_cache_raw_tensors and not use_mamba:
-                    # NOTE: We need to init k cache tensor (nope cache tensor in mla) and
+                    # We need to init k cache tensor (nope cache tensor in mla) and
                     # v cache tensor (rope cache tensor in mla) separately to support prefill disaggregation,
                     # as it only support the 0-dim of kv_cache is `num_blocks`.
                     # For deepseek mla, we need to spilt cache tensor accrodding to the nope head dim
@@ -4666,7 +4730,7 @@ class NPUModelRunner(GPUModelRunner):
             else:
                 # This is likely Mamba or other non-attention cache,
                 # no splitting.
-                # NOTE: set kernel_block_sizes to 0 to disable slotmapping computation
+                # set kernel_block_sizes to 0 to disable slotmapping computation
                 # of mamba block. In this case, BlockTable.block_size will never equal
                 # to kernel_block_sizes[0]
                 self.kernel_block_sizes.append([0])
@@ -4830,7 +4894,7 @@ class NPUModelRunner(GPUModelRunner):
 
         kv_cache_spec: dict[str, list[KVCacheSpec]] = defaultdict(list)
         attn_layers = get_layers_from_vllm_config(self.vllm_config, AttentionLayerBase)
-        # NOTE: Must process Attention/MLAAttention before MambaBase to maintain
+        # Must process Attention/MLAAttention before MambaBase to maintain
         # ordering expected by graph parameter update logic in attention backends.
         mamba_layers: dict[str, MambaBase] = {}
         attn_layer_names = set()

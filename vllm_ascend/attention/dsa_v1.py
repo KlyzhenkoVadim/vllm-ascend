@@ -271,6 +271,11 @@ class AscendDSADecodeMetadata:
     start_pos: torch.Tensor = None
     sas_metadata: torch.Tensor = None
     qli_metadata: torch.Tensor = None
+    #ANCHOR - Metadata构造indexcache相关字段
+    indexcache_batch_mode: IndexCacheDecodeMode | None = None
+    indexcache_req_ids: tuple[str, ...] | None = None
+    qli_seq_lens: torch.Tensor | None = None
+    qli_sparse_count: int | None = None
 
 
 @dataclass
@@ -339,7 +344,7 @@ def _require_decode_metadata(metadata: AscendDSAMetadata) -> AscendDSADecodeMeta
     assert metadata.decode is not None
     return metadata.decode
 
-
+#SECTION - AscendDSAMetadataBuilder
 class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
     # Does this backend/builder support ACL Graphs for attention (default: no).
     aclgraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
@@ -514,6 +519,11 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
     ):
         self.num_actual_tokens = common_attn_metadata.num_actual_tokens
 
+    #SECTION - build
+    # model_runner中调用接口
+    # 模型前向传播过程中，每层都调用一次
+    #LINK - /vllm-workspace/vllm-ascend/vllm_ascend/worker/model_runner_v1.py:3015
+    # 基于model_runner构造和传入的AscendCommonAttentionMetadata，构建AscendDSADecodeMetadata、AscendDSAPrefillMetadata
     def build(
         self,
         common_prefix_len: int,
@@ -526,6 +536,9 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         num_reqs_actual = kwargs.get("num_reqs_actual")
         self.prefill_ratio_to_sas_metadata = kwargs.get("prefill_ratio_to_sas_metadata")
         self.decode_ratio_to_sas_metadata = kwargs.get("decode_ratio_to_sas_metadata")
+        #ANCHOR - 获取model_runner传入的indexcache相关变量
+        indexcache_batch_decode_mode = kwargs.get("indexcache_batch_decode_mode")
+        indexcache_batch_req_ids = kwargs.get("indexcache_batch_req_ids")
         assert self.prefill_ratio_to_sas_metadata is not None
         assert self.decode_ratio_to_sas_metadata is not None
         self.block_size = kwargs.get("block_size", 128)
@@ -589,7 +602,8 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         decode_metadata = None
 
         if self.num_decodes > 0:
-            decode_metadata = self.build_decode_metadata(common_prefix_len, common_attn_metadata, num_reqs_actual)
+            #ANCHOR - 将indexcache相关变量传入build_decode_metadata
+            decode_metadata = self.build_decode_metadata(common_prefix_len, common_attn_metadata, num_reqs_actual, indexcache_batch_decode_mode, indexcache_batch_req_ids)
 
         return self.metadata_cls(  # type: ignore
             num_input_tokens=common_attn_metadata.num_input_tokens,
@@ -611,6 +625,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             sin=sin,
             hadamard=AscendDSAMetadataBuilder.hadamard,
         )
+    #!SECTION
 
     def build_prefill_metadata(
         self,
@@ -870,11 +885,15 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             cu_c128_cmp_seqlen_list=cu_c128_cmp_seqlen_list,
         )
 
+    #SECTION - build_decode_metadata
     def build_decode_metadata(
         self,
         common_prefix_len: int,
         common_attn_metadata: AscendCommonAttentionMetadata,
         num_reqs_actual: int | None,
+        #ANCHOR - 函数签名增加indexcache相关变量
+        indexcache_batch_mode: IndexCacheDecodeMode | None = None,
+        indexcache_batch_req_ids: tuple[str, ...] | None = None,
     ) -> AscendDSADecodeMetadata:
         assert self.decode_ratio_to_sas_metadata is not None
         if self.decode_ratio_to_sas_metadata.get("query_start_loc", None) is None:
@@ -958,6 +977,15 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             compress_cos = self.decode_ratio_to_sas_metadata[layer_name + "_cos"]
             compress_sin = self.decode_ratio_to_sas_metadata[layer_name + "_sin"]
 
+        #NOTE - compressed_decode_num
+        # 实际是计算本轮decode中，合法的到边界的compressed_token，看返回值compressed_decode_num
+        # 这个值主要用于compressed_tokens_start，用于下方找slot_mapping的切片
+        # 由于无效压缩token不占slot_mapping，有效压缩token被compact到buffer连续前缀，所以compressed_decode_num可以直接用于切片，得到合法slot_mapping
+        #LINK - /vllm-workspace/vllm-ascend/vllm_ascend/worker/model_runner_v1.py:1074
+        # 例子：
+        # decode_input_positions=[9, 11], compressor_ratio=4
+        # mask=[False, True], compressed_decode_num=1
+        # slot_mapping[:1]
         def _get_compressed_decode_token_start(decode_input_positions, compress_ratio):
             # Note(qcs): some models use compress_ratio=0 as non-compression tag.
             if compress_ratio == 0:
@@ -1097,10 +1125,11 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 key_quant_mode=0,
                 batch_size=len(self.seq_lens[: self.num_decodes]),
                 max_seqlen_q=max_seqlen_q,
-                max_seqlen_k=max_seqlen_kv,
+                max_seqlen_k=qli_max_seqlen_k,
                 layout_query="TND",
                 layout_key="PA_BSND",
-                sparse_count=self.model_config.hf_config.index_topk,  # 512
+                sparse_count=qli_sparse_count,
+                # sparse_count=self.model_config.hf_config.index_topk,  # 512
                 sparse_mode=3,
                 pre_tokens=(1 << 63) - 1,
                 next_tokens=(1 << 63) - 1,
@@ -1129,8 +1158,13 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             start_pos=self.start_pos_decode[: self.num_decodes],  # cached
             sas_metadata=self.decode_sas_metadata,
             qli_metadata=self.decode_qli_metadata,
+            indexcache_batch_mode=indexcache_batch_mode,
+            indexcache_req_ids=tuple(indexcache_batch_req_ids[: self.num_decodes]) if indexcache_batch_req_ids is not None else None,
+            qli_seq_lens=qli_seq_lens,
+            qli_sparse_count=qli_sparse_count,
         )
         return decode_metadata
+    #!SECTION
 
     def build_for_drafting(
         self,
@@ -1357,7 +1391,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
     def get_block_table_size(self, common_attn_metadata: AscendCommonAttentionMetadata, build_metadata_step: int):
         if build_metadata_step == BUILD_METADATA_STEP_PREFILL:
             # If graph_pad_size > -1, mean is running in fullgraph mode.
-            # NOTE: Maybe this block_table change can be removed when graph_pad_size > 1.
+            # Maybe this block_table change can be removed when graph_pad_size > 1.
             # if self.graph_pad_size > common_attn_metadata.num_reqs and \
             #         self.speculative_config.disable_padded_drafter_batch:
             #     return self.graph_pad_size
@@ -1384,8 +1418,9 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         assert attn_metadata is not None
         attn_metadata.attn_state = attn_state
         return attn_metadata
+#!SECTION
 
-
+#SECTION - AscendDSAImpl
 class AscendDSAImpl(DSAAttentionImpl):
     """
     NOTE: Please read the comment at the top of the file before trying to
@@ -1469,6 +1504,10 @@ class AscendDSAImpl(DSAAttentionImpl):
             self.indexcom_head_dim = self.indexer.compressor.head_dim
             self.indexcom_rotate = self.indexer.compressor.rotate
             self.index_topk = self.indexer.index_topk
+            #ANCHOR - DSAImpl定义indexcache相关字段
+            # layer_name -> req_id -> full topm idxs
+            # anchor轮保存原始topm idx，reuse轮用它把local topk映射回全局compressed idx
+            self.indexcache_topm_idx_cache: dict[str, dict[str, torch.Tensor]] = {}
 
         # compress param
         if self.compressor is not None:
@@ -1516,7 +1555,7 @@ class AscendDSAImpl(DSAAttentionImpl):
     def process_weights_after_loading(self, act_dtype: torch.dtype):
         pass
 
-    # TODO: cast to bfloat16 to speed up
+    # cast to bfloat16 to speed up
     def rope_single(self, x, cos, sin, inverse=False):
         if inverse:
             sin = -sin
@@ -1913,6 +1952,11 @@ class AscendDSAImpl(DSAAttentionImpl):
             coff = 2 if self.compressor_overlap else 1
 
             # Inline compressor + scatter (c128, c4 non-dual)
+            #SECTION - cmp_kv
+            #LINK - /vllm-workspace/vllm-ascend/csrc/attention/compressor/README.md
+            # 每轮decode都调用，更新state_cache，存储当前compressor中间状态，计算cmp_kv
+            # cmp_kv只有在压缩边界才有意义，才会构造slot_mapping写入cache
+            # cmp_kv不在压缩边界时不是有效结果，即使计算也不会写入cache
             compressed_kv = torch.ops._C_ascend.compressor(
                 hidden_states,
                 self.compressor_wkv.weight,
@@ -2040,6 +2084,221 @@ class AscendDSAImpl(DSAAttentionImpl):
                 )[0]
         return attn_output
 
+    #ANCHOR - save topm_idxs
+    def _save_indexcache_anchor_topm_idxs(
+        self,
+        layer_name: str,
+        req_ids: tuple[str, ...] | None,
+        topm_idxs: torch.Tensor,
+    ) -> None:
+        if req_ids is None:
+            return
+
+        # QLI output shape [num_decode_tokens, 1, topM]。seq_len < topM时尾部补-1。
+        topm_idxs_2d = topm_idxs[:, 0, :]
+        num_decode_rows = topm_idxs_2d.shape[0]
+
+        layer_topm_idx_cache = self.indexcache_topm_idx_cache.setdefault(layer_name, {})
+
+        # 当前未开MTP，decode row和req_id一一对应；MTP需要额外的token-row到req映射。
+        # req_id才是跨decode轮稳定的请求标识，row_idx只是当前batch内的位置。
+        for row_idx, req_id in enumerate(req_ids):
+            layer_topm_idx_cache[req_id] = topm_idxs_2d[row_idx].clone()
+
+    #ANCHOR - gather topm kv and save in indexer_local_k_cache
+    def _save_indexcache_anchor_topm_local_kv(
+        self,
+        topm_idxs: torch.Tensor,
+        indexer_k_cache: torch.Tensor,
+        indexer_scale_cache: torch.Tensor,
+        indexer_local_k_cache: torch.Tensor,
+        indexer_local_scale_cache: torch.Tensor,
+        global_block_table: torch.Tensor,
+        local_block_table: torch.Tensor,
+    ) -> None:
+        # QLI 输出 topm_idxs: [num_decode_rows, 1, topM]，当前 topM 通常为 2048。
+        # 去掉中间长度为 1 的维度后，topm_idxs_2d: [num_decode_rows, topM]。
+        topm_idxs_2d = topm_idxs[:, 0, :].to(torch.long)
+        num_decode_rows, topm_count = topm_idxs_2d.shape
+        block_size = indexer_k_cache.shape[1]   # 128
+        assert topm_count % block_size == 0
+
+        # Phase 1: 从 global indexer K/scale cache 收集 topM K/scale
+        # 短 prompt 选不满 topM 时，topm_idxs 尾部使用 -1 表示 padding。
+        # valid_topm_mask: [num_decode_rows, topM]，后面用它将 padding 对应的 K/scale 清零。
+        valid_topm_mask = topm_idxs_2d >= 0
+        # gather 不接受负索引，因此临时将 -1 替换为 0；真实 index 0 仍由 valid_topm_mask 区分。
+        # safe_topm_idxs 形状仍为 [num_decode_rows, topM]。
+        safe_topm_idxs = topm_idxs_2d.clamp_min(0)
+        # idx // 128 得到 block_table 的逻辑 block id（序号），查询 block_table 后得到全局 cache 中的物理 block id。
+        # topm_block_idxs/topm_block_offsets: [num_decode_rows, topM]。
+        topm_block_idxs = torch.gather(
+            global_block_table.to(torch.long)[:num_decode_rows], 
+            1, 
+            torch.div(safe_topm_idxs, block_size, rounding_mode="floor")
+        )
+        topm_block_offsets = safe_topm_idxs % block_size
+
+        # 为了使用 torch_npu.npu_gather_sparse_index 收集 topm_k_cache
+        # 需要 flatten 拉平，torch_npu.npu_gather_sparse_index 仅 支持 1D 索引
+        # indexer_k_cache (int8) 和 indexer_scale_cache (float16)
+        #   shape:   [num_blocks, 128, 1, 128]  [num_blocks, 128, 1, 1]
+        #   stride:  [16640, 128, 128, 1]       [8320, 1, 1, 1]
+        # 一个 K slot 包含 1 * 128 = 128 个 int8，一个 K block 包含 128 个slot，共 16384 字节。
+        # stride(0)=16640 是完整 page 大小，其中多出的 256 字节保存该 block 的 float16 scale，因此不能直接合并前两维。
+        # 16640 // 128 = 130 行：前 128 行是 K，最后 2 行是 scale。
+        # 内存布局：[K0][Scale0][K1][Scale1]...
+        k_slot_width = math.prod(indexer_k_cache.shape[2:])             # 128
+        k_rows_per_page = indexer_k_cache.stride(0) // k_slot_width     # 130，每行对应一个 K + Scale Block，取代原来每行一个 K Block 128 元素的语义
+        # 将底层 storage 构造成后续仅用于读取的二维 table，torch.as_strided 仅改元数据：
+        #   shape  = [num_blocks * 130, 128]
+        #   stride = [128, 1]
+        flat_indexer_k_cache = torch.as_strided(
+            indexer_k_cache,
+            size=(indexer_k_cache.shape[0] * k_rows_per_page, k_slot_width),
+            stride=(k_slot_width, 1),
+            storage_offset=indexer_k_cache.storage_offset(),
+        )
+        # flat_topm_k_idxs: [num_decode_rows, topM]。
+        flat_topm_k_idxs = topm_block_idxs * k_rows_per_page + topm_block_offsets
+
+        # scale cache 的 storage_offset 指向第 0 个 page 末尾的 scale 区域，
+        # stride(0) 是相邻 page 的 FP16 元素间距。将这段 storage 构造为
+        # 宽度为 1 的二维 table，使每个 scale slot 可以用一个线性索引读取。
+        scale_slot_width = math.prod(indexer_scale_cache.shape[2:])          # 1
+        scale_rows_per_page = (                                             # 8320
+            indexer_scale_cache.stride(0) // scale_slot_width
+        )
+        # 从第 0 个 page 的 scale 起点延伸到最后一个 scale block 末尾，
+        # 避免从非零 storage_offset 创建越过底层 storage 的 view。
+        flat_scale_row_count = (
+            (indexer_scale_cache.shape[0] - 1) * scale_rows_per_page
+            + indexer_scale_cache.shape[1]
+        )
+        flat_indexer_scale_cache = torch.as_strided(
+            indexer_scale_cache,
+            size=(flat_scale_row_count, scale_slot_width),
+            stride=(scale_slot_width, 1),
+            storage_offset=indexer_scale_cache.storage_offset(),
+        )
+        # flat_topm_scale_idxs: [num_decode_rows, topM]。
+        flat_topm_scale_idxs = (
+            topm_block_idxs * scale_rows_per_page + topm_block_offsets
+        )
+
+        # sparse gather 输出 [num_decode_rows, topM, 128]
+        # unsqueeze(-2) 恢复为 [num_decode_rows, topM, 1, 128]
+        topm_k_cache = torch_npu.npu_gather_sparse_index(
+            flat_indexer_k_cache,
+            flat_topm_k_idxs,
+        ).unsqueeze(-2)
+        # sparse gather 输出 [num_decode_rows, topM, 1]，
+        # unsqueeze(-2) 恢复为 [num_decode_rows, topM, 1, 1]。
+        topm_scale_cache = torch_npu.npu_gather_sparse_index(
+            flat_indexer_scale_cache,
+            flat_topm_scale_idxs,
+        ).unsqueeze(-2)
+
+        # padding 位置此前安全读取了 token 0，现在统一覆盖为全 0；所有 shape 保持不变。
+        topm_k_cache = torch.where(
+            valid_topm_mask[..., None, None],
+            topm_k_cache,
+            torch.zeros_like(topm_k_cache),
+        )
+        topm_scale_cache = torch.where(
+            valid_topm_mask[..., None, None],
+            topm_scale_cache,
+            torch.zeros_like(topm_scale_cache),
+        )
+
+        # Phase 2: 将 topm K/scale 写入 indexer local cache
+        # topM=2048、block_size=128 时，每个 request 使用 16 个 local block
+        num_topm_blocks = topm_count // block_size
+
+        # 取出 local cache 中保存 topM 的物理 block id
+        # local_block_table: [num_decode_rows, max_num_blocks]
+        # local_topm_block_mapping: [num_decode_rows * num_topm_blocks, 1]
+        local_topm_block_mapping = local_block_table[
+            :num_decode_rows, :num_topm_blocks
+        ].reshape(-1, 1).to(torch.int32)
+
+        # 每个连续的 block_size 个 topM 项组成一个完整 local block
+        # topm_k_blocks: [num_decode_rows * num_topm_blocks, 128, 1, 128]
+        # topm_scale_blocks: [num_decode_rows * num_topm_blocks, 128, 1, 1]
+        topm_k_blocks = topm_k_cache.reshape(
+            num_decode_rows * num_topm_blocks,
+            block_size,
+            *topm_k_cache.shape[2:],
+        )
+        topm_scale_blocks = topm_scale_cache.reshape(
+            num_decode_rows * num_topm_blocks,
+            block_size,
+            *topm_scale_cache.shape[2:],
+        )
+
+        # mapping 的每一行只包含物理 block id，scatter 将对应的完整 K/scale block
+        # 写入 indexer_local_k_cache 和 indexer_local_scale_cache
+        torch.ops._C_ascend.npu_scatter_nd_update_v2(
+            indexer_local_k_cache, local_topm_block_mapping, topm_k_blocks
+        )
+        torch.ops._C_ascend.npu_scatter_nd_update_v2(
+            indexer_local_scale_cache, local_topm_block_mapping, topm_scale_blocks
+        )
+
+    #ANCHOR - local topk_idxs -> global topk_idxs
+    # local_topk_idxs的值域是[0, topM)，对应anchor轮保存的topM局部位置。
+    def _restore_indexcache_reuse_topk_idxs(
+        self,
+        layer_name: str,
+        req_ids: tuple[str, ...] | None,
+        local_topk_idxs: torch.Tensor,
+    ) -> torch.Tensor:
+        assert req_ids is not None
+
+        # QLI output shape [num_decode_tokens, 1, topk].
+        local_topk_idxs_2d = local_topk_idxs[:, 0, :].to(torch.long)
+        layer_topm_idx_cache = self.indexcache_topm_idx_cache[layer_name]
+        # 根据 req_id 对齐 topk 和 topm
+        saved_topm_idxs = torch.stack(
+            [layer_topm_idx_cache[req_id].to(local_topk_idxs_2d.device) for req_id in req_ids],
+            dim=0,
+        )
+        # QLI可能返回-1表示无效位置，gather不支持负数索引
+        valid_topk_mask = local_topk_idxs_2d >= 0
+        safe_local_topk_idxs = local_topk_idxs_2d.clamp_min(0)
+        # torch.gather 恢复映射
+        global_topk_idxs = torch.gather(saved_topm_idxs, 1, safe_local_topk_idxs)
+        global_topk_idxs = torch.where(
+            valid_topk_mask,
+            global_topk_idxs,
+            torch.full_like(global_topk_idxs, -1),
+        )
+        return global_topk_idxs[:, None, :].to(local_topk_idxs.dtype)
+
+    #SECTION - forward_decode
+    # CSA-token-indexcache
+    # 1. 怎么判断anchor
+    # 加个字段req_id，为每个req维护anchor状态表
+    # qlens=[1,2,3] anchor_mask=[Y,N,N]
+
+    # 2. anchor和非anchor qli逻辑
+
+    # 2.1 anchor和非anchor用不同indexer_k_cache，分别调用qli，然后拼接
+    # 但这样动态分组，在decode graph内部，anchor和非anchor组tenshor shape会变化，图不友好
+    # 如果想图友好，就得在model_runner重排batch和metadata：anchor decode/non-anchor decode/prefill，然后分段跑不同QLI，过于复杂
+
+    # 2.2 统一anchor：存在anchor即全走full_qli，全是非anchor再topm_qli，单轮decode单类qli，图友好，性能差一点
+    # HOST侧决策anchor/non-anchor，forward_decode里if else消费HOST侧变量，不动态判断，不会破坏图
+    # anchor/non-anchor 最好形成两套计算图 ACL graph，需要将这个变量定义如 graph descriptor
+    #LINK - /vllm-workspace/vllm-ascend/vllm_ascend/worker/model_runner_v1.py:2679
+    # 这个决策点需要记录每个req的last_anchor_position，然后只要有一个新请求/老请求到了新anchor点，就全部走anchor
+    # build_decode_metadata中没有req信息，最好在model_runner的metadata中计算，只需要增加少量metadata字段就行
+    # 待确认：在什么位置计算
+    #LINK - /vllm-workspace/vllm-ascend/vllm_ascend/worker/model_runner_v1.py:1810
+    
+    # 3. topm_indexer_k_cache
+    # topm_indexer_k_cache
+    # topm_indexer_scale_decode_metadata: 重点是block_table（读），slot_mapping（写）好像不用操心，有专门的算子基于topk_idxs gather和写入，其他可以仿indexer_scale_decode_metadata
     def _forward_decode(
         self,
         layer_name,
@@ -2177,6 +2436,8 @@ class AscendDSAImpl(DSAAttentionImpl):
                     compress_topk_idxs = self._get_indexcache_topk_indices(decode_num_tokens, offset=0)
                 else:
                     if self.multistream_dsv4_dsa_overlap:
+                        #NOTE - multistream indexer_q
+                        # cv指CV wrapper: split wq_a/wkv/wq_b into quantize(Vector) + matmul(Cube)，cube/vector多流并行，定义于1392行
                         indexer_q = self.cv_indexer_select_qli(  # multistream version
                             x=hidden_states,
                             qr=qr,
@@ -2209,6 +2470,11 @@ class AscendDSAImpl(DSAAttentionImpl):
             coff = 2 if self.compressor_overlap else 1
 
             # Inline compressor + scatter (c128, c4 non-dual)
+            #SECTION - cmp_kv
+            #LINK - /vllm-workspace/vllm-ascend/csrc/attention/compressor/README.md
+            # 每轮decode都调用，更新state_cache，存储当前compressor中间状态，计算cmp_kv
+            # cmp_kv只有在压缩边界才有意义，才会构造slot_mapping写入cache
+            # cmp_kv不在压缩边界时不是有效结果，即使计算也不会写入cache
             compressed_kv = torch.ops._C_ascend.compressor(
                 hidden_states,
                 self.compressor_wkv.weight,
@@ -2271,13 +2537,40 @@ class AscendDSAImpl(DSAAttentionImpl):
                     key_quant_mode=0,
                     layout_query="TND",
                     layout_key="PA_BSND",
-                    sparse_count=self.index_topk,
+                    sparse_count=qli_sparse_count,
                     sparse_mode=3,
                     pre_tokens=(1 << 63) - 1,
                     next_tokens=(1 << 63) - 1,
                     cmp_ratio=4,
                     return_value=False,
                 )
+                #LINK - /vllm-workspace/vllm-ascend/csrc/attention/quant_lightning_indexer/README.md
+
+                if indexcache_batch_mode is IndexCacheDecodeMode.REUSE:
+                    compress_topk_idxs = self._restore_indexcache_reuse_topk_idxs(
+                        layer_name=layer_name,
+                        req_ids=indexcache_req_ids,
+                        local_topk_idxs=compress_topk_idxs,
+                    )
+                elif indexcache_batch_mode is IndexCacheDecodeMode.ANCHOR:
+                    compress_topm_idxs = compress_topk_idxs
+                    self._save_indexcache_anchor_topm_idxs(
+                        layer_name=layer_name,
+                        req_ids=indexcache_req_ids,
+                        topm_idxs=compress_topm_idxs,
+                    )
+                    indexer_local_decode_metadata = _require_decode_metadata(indexer_local_kv_scale_metadata)
+                    self._save_indexcache_anchor_topm_local_kv(
+                        topm_idxs=compress_topm_idxs,
+                        indexer_k_cache=indexer_k_cache,
+                        indexer_scale_cache=indexer_scale_cache,
+                        indexer_local_k_cache=indexer_local_k_cache,
+                        indexer_local_scale_cache=indexer_local_scale_cache,
+                        global_block_table=block_table,
+                        local_block_table=indexer_local_decode_metadata.block_table,
+                    )
+                    compress_topk_idxs = compress_topm_idxs[..., :self.index_topk]
+            #!SECTION
 
             if self.compress_ratio == 4 and self.use_index_cache:
                 self._update_indexcache_topk_indices(compress_topk_idxs, offset=0)
@@ -2412,6 +2705,8 @@ class AscendDSAImpl(DSAAttentionImpl):
             kv_block_table = indexer_state_decode_metadata.block_table
             start_pos = indexer_scale_decode_metadata.start_pos
 
+        #NOTE - multistream indexer_k
+        # indexer_k 逻辑同 cmp_kv
         kv = torch.ops._C_ascend.compressor(
             x,
             self.indexcom_wkv.weight,
@@ -2632,6 +2927,8 @@ class AscendDSAImpl(DSAAttentionImpl):
             kv_block_table = indexer_state_decode_metadata.block_table
             start_pos = indexer_scale_decode_metadata.start_pos
 
+        #NOTE - multistream indexer_k
+        # indexer_k 逻辑同 cmp_kv
         kv = torch.ops._C_ascend.compressor(
             x,
             self.indexcom_wkv.weight,
@@ -2737,3 +3034,4 @@ class AscendDSAImpl(DSAAttentionImpl):
         q = hadamard_scale(q_linear, q_shape, q_dim, scale=hidden_size**-0.5)
 
         return q
+#!SECTION
