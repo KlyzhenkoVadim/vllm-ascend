@@ -109,6 +109,7 @@ from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBui
 from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder
 from vllm_ascend.attention.mla_v1 import AscendMLABackend
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, using_paged_attention
+from vllm_ascend.indexcache import IndexCacheDecodeMode
 
 # yapf conflicts with isort for this block
 # yapf: disable
@@ -317,9 +318,14 @@ class NPUModelRunner(GPUModelRunner):
 
         self.sampler = AscendSampler()
         self.attn_state: AscendAttentionState | None = None
+        self.indexcache_last_anchor_pos: dict[str, int] = {}
+        self.indexcache_decode_cur_pos: dict[str, int] = {}
+        self.indexcache_decode_is_anchor: dict[str, bool] = {}
+        self.indexcache_batch_decode_mode = IndexCacheDecodeMode.DISABLED
 
         # Ascend-specific configurations
         self.ascend_config = get_ascend_config()
+        self.indexcache_anchor_interval = self.ascend_config.indexcache_anchor_interval
         set_weight_prefetch_method(self.ascend_config.weight_prefetch_config)
         # Dump / PrecisionDebugger configuration now comes from AscendConfig
         dump_cfg = self.ascend_config.dump_config_path
@@ -2220,6 +2226,31 @@ class NPUModelRunner(GPUModelRunner):
                         num_tokens_padded, num_reqs_padded, num_reqs, cudagraph_mode, batch_desc.num_reqs
                     )
 
+                self.indexcache_decode_cur_pos.clear()
+                self.indexcache_decode_is_anchor.clear()
+                if not self.ascend_config.enable_local_k_cache:
+                    indexcache_batch_decode_mode = IndexCacheDecodeMode.DISABLED
+                else:
+                    computed_tokens = self.input_batch.num_computed_tokens_cpu[:num_reqs]
+                    for req_index in range(num_reqs):
+                        req_id = req_ids[req_index]
+                        is_normal_decode = (computed_tokens[req_index] and num_scheduled_tokens_np[req_index] == 1)
+                        if not is_normal_decode:
+                            continue
+                        last_anchor_pos = self.indexcache_last_anchor_pos.setdefault(req_id, -1)
+                        cur_pos = computed_tokens[req_index]
+                        is_anchor = (last_anchor_pos < 0 or cur_pos - last_anchor_pos >= self.indexcache_anchor_interval)
+                        self.indexcache_decode_cur_pos[req_id] = cur_pos
+                        self.indexcache_decode_is_anchor[req_id] = is_anchor
+                    if len(self.indexcache_decode_is_anchor) == 0:
+                        indexcache_batch_decode_mode = IndexCacheDecodeMode.DISABLED
+                    elif any(self.indexcache_decode_is_anchor.values()):
+                        indexcache_batch_decode_mode = IndexCacheDecodeMode.ANCHOR
+                    else:
+                        indexcache_batch_decode_mode = IndexCacheDecodeMode.REUSE
+
+                indexcache_batch_req_ids = tuple(req_ids[:num_reqs])
+
                 (attn_metadata, spec_decode_common_attn_metadata) = self._build_attention_metadata(
                     num_tokens=num_tokens_unpadded
                     if not (self.use_cp and self.pcp_manager.pcp_use_hybrid_attn)
@@ -2235,6 +2266,8 @@ class NPUModelRunner(GPUModelRunner):
                     num_scheduled_tokens_np=num_scheduled_tokens_np,
                     cascade_attn_prefix_lens=cascade_attn_prefix_lens,
                     num_scheduled_tokens_compressed_list=num_scheduled_tokens_compressed_list,
+                    indexcache_batch_decode_mode=indexcache_batch_decode_mode,
+                    indexcache_batch_req_ids=indexcache_batch_req_ids,
                 )
 
                 self._sanitize_placeholder_input_ids_for_forward(
@@ -2313,6 +2346,9 @@ class NPUModelRunner(GPUModelRunner):
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
+            if self.indexcache_batch_decode_mode is IndexCacheDecodeMode.ANCHOR:
+                for req_id, cur_pos in self.indexcache_decode_cur_pos.items():
+                    self.indexcache_last_anchor_pos[req_id] = cur_pos
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs:
@@ -3030,6 +3066,8 @@ class NPUModelRunner(GPUModelRunner):
         num_scheduled_tokens_np: np.ndarray | None = None,
         cascade_attn_prefix_lens: list[list[int]] | None = None,
         num_scheduled_tokens_compressed_list: list[np.ndarray] | None = None,
+        indexcache_batch_decode_mode: IndexCacheDecodeMode = IndexCacheDecodeMode.DISABLED,
+        indexcache_batch_req_ids: tuple[str, ...] | None = None,
     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
         """
         :return: tuple[attn_metadata, spec_decode_common_attn_metadata]
@@ -3212,6 +3250,8 @@ class NPUModelRunner(GPUModelRunner):
             prefill_ratio_to_sas_metadata: dict,
             decode_ratio_to_sas_metadata: dict,
             common_ratio_to_sas_metadata: dict,
+            indexcache_batch_decode_mode=IndexCacheDecodeMode.DISABLED,
+            indexcache_batch_req_ids=None,
             ubid: int | None = None,
         ) -> None:
             attn_group = self.attn_groups[kv_cache_gid][attn_gid]
@@ -3237,6 +3277,8 @@ class NPUModelRunner(GPUModelRunner):
                         decode_ratio_to_sas_metadata=dict(),
                         common_ratio_to_sas_metadata=dict(),
                         block_size=attn_group.kv_cache_spec.block_size,
+                        indexcache_batch_decode_mode=IndexCacheDecodeMode.DISABLED,
+                        indexcache_batch_req_ids=None,
                         )
                 else:
                     extra_attn_metadata_args = dict(
@@ -3246,6 +3288,8 @@ class NPUModelRunner(GPUModelRunner):
                         decode_ratio_to_sas_metadata=decode_ratio_to_sas_metadata,
                         common_ratio_to_sas_metadata=common_ratio_to_sas_metadata,
                         block_size=attn_group.kv_cache_spec.block_size,
+                        indexcache_batch_decode_mode=indexcache_batch_decode_mode,
+                        indexcache_batch_req_ids=indexcache_batch_req_ids,
                         )
 
             # add kvcomp_metadata into common_attn_metadata

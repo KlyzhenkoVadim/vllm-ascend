@@ -444,6 +444,12 @@ class FinegrainedTPConfig:
         self.mlp_tensor_parallel_size = finegrained_tp_config.get("mlp_tensor_parallel_size", 0)
         self.olora_tensor_parallel_size = finegrained_tp_config.get("olora_tensor_parallel_size", 0)
 
+        self.enable_local_k_cache = additional_config.get("enable_local_k_cache", False)
+        self.indexcache_anchor_interval = additional_config.get("indexcache_anchor_interval", 4)
+        self.indexcache_topm = additional_config.get("indexcache_topm", 2048)
+        self.indexcache_prefill_topm = additional_config.get("indexcache_prefill_topm", 16384)
+        self.indexcache_buffer_len = additional_config.get("indexcache_buffer_len", 16384)
+
         enabled_configs = []
         if self.oproj_tensor_parallel_size > 0:
             enabled_configs.append(f"oproj_tensor_parallel_size={self.oproj_tensor_parallel_size}")

@@ -112,6 +112,9 @@ class AscendDeepseekSparseAttention(MultiHeadLatentAttentionWrapper):
         self.skip_topk = dsa_modules.skip_topk
         self.prefix = prefix
 
+        from vllm_ascend.ascend_config import get_ascend_config
+        self.enable_local_k_cache = get_ascend_config().enable_local_k_cache
+
         self.swa_cache_layer = dsa_modules.swa_cache_layer
 
         self.dsa_attn = DSAAttention(
@@ -232,6 +235,8 @@ def _build_kv_cache(self, forward_context):
     indexer_k_cache = None
     indexer_scale_cache = None
     indexer_full_cache = None
+    indexer_local_k_cache = None
+    indexer_local_scale_cache = None
 
     if self.compress_ratio > 1:
         state_cache = self.compressor.state_cache.kv_cache
@@ -252,6 +257,20 @@ def _build_kv_cache(self, forward_context):
                 self.indexer.k_cache.kv_cache[0][0],
                 self.indexer.k_cache.kv_cache[0][1],
             )
+        if self.enable_local_k_cache:
+            indexer_local_k_cache, indexer_local_scale_cache = (
+                self.indexer.local_k_cache.kv_cache[0][0],
+                self.indexer.local_k_cache.kv_cache[0][1],
+            )
+
+    if self.enable_local_k_cache:
+        return tuple(
+            unfold_kvcache(c) for c in (
+                compress_kv_cache, swa_kv_cache, state_cache,
+                indexer_state_cache, indexer_k_cache, indexer_scale_cache,
+                indexer_local_k_cache, indexer_local_scale_cache,
+            )
+        )
 
     if get_ascend_device_type() in {AscendDeviceType.A5}:
         kv_cache = tuple(
