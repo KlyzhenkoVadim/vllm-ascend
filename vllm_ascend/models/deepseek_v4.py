@@ -174,6 +174,40 @@ class AscendDeepseekV4IndexerCache(DeepseekV4IndexerCache):
         return _get_ascend_dsa_backend()
 
 
+class AscendDeepseekV4IndexerLocalCache(DeepseekV4IndexerCache):
+    def __init__(
+        self,
+        head_dim: int,
+        dtype: torch.dtype,
+        prefix: str,
+        cache_config: CacheConfig,
+        compress_ratio: int = 1,
+    ):
+        super().__init__(head_dim, dtype, prefix, cache_config, compress_ratio)
+
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+        from vllm_ascend.ascend_config import get_ascend_config
+        from vllm_ascend.core.kv_cache_interface import FixedCacheSpec
+
+        return FixedCacheSpec(
+            block_size=self.cache_config.block_size,
+            num_kv_heads=1,
+            head_size=self.head_dim,
+            dtype=self.dtype,
+            model_version="deepseek_v4",
+            compress_ratio=self.compress_ratio,
+            cache_dtype_str=self.cache_config.cache_dtype,
+            scale_dim=1 if self.head_dim == 128 else 0,
+            scale_dtype=torch.float16,
+            fixed_token_lengths=get_ascend_config().indexcache_buffer_len,
+        )
+
+    def forward(self): ...
+
+    def get_attn_backend(self):
+        return _get_ascend_dsa_backend()
+
+
 class AscendDeepseekV4SWACache(VllmDeepseekV4SWACache):
     def __init__(
         self,
@@ -576,6 +610,16 @@ class Indexer(nn.Module):
                 cache_config=cache_config,
                 compress_ratio=self.compress_ratio,
             )
+
+            from vllm_ascend.ascend_config import get_ascend_config
+            if get_ascend_config().enable_local_k_cache:
+                self.local_k_cache = AscendDeepseekV4IndexerLocalCache(
+                    head_dim=self.head_dim,
+                    dtype=k_dtype,
+                    prefix=f"{prefix}.local_k_cache",
+                    cache_config=cache_config,
+                    compress_ratio=self.compress_ratio,
+                )
         self.compressor = None
         if self.compress_ratio > 1:
             self.compressor = Compressor(

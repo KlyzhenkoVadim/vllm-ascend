@@ -1433,6 +1433,7 @@ class AscendDSAImpl(DSAAttentionImpl):
             self.indexcom_head_dim = self.indexer.compressor.head_dim
             self.indexcom_rotate = self.indexer.compressor.rotate
             self.index_topk = self.indexer.index_topk
+            self.indexcache_topm_idx_cache: dict[str, dict[str, torch.Tensor]] = {}
 
         # compress param
         if self.compressor is not None:
@@ -2818,3 +2819,106 @@ class AscendDSAImpl(DSAAttentionImpl):
         q = hadamard_scale(q_linear, q_shape, q_dim, scale=hidden_size**-0.5)
 
         return q
+
+    def _save_indexcache_anchor_topm_idxs(
+        self, layer_name: str, req_ids: tuple[str, ...] | None, topm_idxs: torch.Tensor,
+    ) -> None:
+        if req_ids is None:
+            return
+        topm_idxs_2d = topm_idxs[:, 0, :].to(torch.long)
+        layer_cache = self.indexcache_topm_idx_cache.setdefault(layer_name, {})
+        for row_idx, req_id in enumerate(req_ids):
+            layer_cache[req_id] = topm_idxs_2d[row_idx].clone()
+
+    def _save_indexcache_anchor_topm_local_kv(
+        self, topm_idxs: torch.Tensor,
+        indexer_k_cache: torch.Tensor, indexer_scale_cache: torch.Tensor,
+        indexer_local_k_cache: torch.Tensor, indexer_local_scale_cache: torch.Tensor,
+        global_block_table: torch.Tensor, local_block_table: torch.Tensor,
+    ) -> None:
+        import math, torch_npu
+
+        topm_idxs_2d = topm_idxs[:, 0, :].to(torch.long)
+        num_decode_rows, topm_count = topm_idxs_2d.shape
+        block_size = indexer_k_cache.shape[1]
+        assert topm_count % block_size == 0
+
+        valid_topm_mask = topm_idxs_2d >= 0
+        safe_topm_idxs = topm_idxs_2d.clamp_min(0)
+        topm_block_idxs = torch.gather(
+            global_block_table.to(torch.long)[:num_decode_rows], 1,
+            torch.div(safe_topm_idxs, block_size, rounding_mode="floor"),
+        )
+        topm_block_offsets = safe_topm_idxs % block_size
+
+        k_slot_width = math.prod(indexer_k_cache.shape[2:])
+        k_rows_per_page = indexer_k_cache.stride(0) // k_slot_width
+        flat_indexer_k_cache = torch.as_strided(
+            indexer_k_cache,
+            size=(indexer_k_cache.shape[0] * k_rows_per_page, k_slot_width),
+            stride=(k_slot_width, 1),
+            storage_offset=indexer_k_cache.storage_offset(),
+        )
+        flat_topm_k_idxs = topm_block_idxs * k_rows_per_page + topm_block_offsets
+
+        scale_slot_width = math.prod(indexer_scale_cache.shape[2:])
+        scale_rows_per_page = indexer_scale_cache.stride(0) // scale_slot_width
+        flat_scale_row_count = (
+            (indexer_scale_cache.shape[0] - 1) * scale_rows_per_page
+            + indexer_scale_cache.shape[1]
+        )
+        flat_indexer_scale_cache = torch.as_strided(
+            indexer_scale_cache,
+            size=(flat_scale_row_count, scale_slot_width),
+            stride=(scale_slot_width, 1),
+            storage_offset=indexer_scale_cache.storage_offset(),
+        )
+        flat_topm_scale_idxs = topm_block_idxs * scale_rows_per_page + topm_block_offsets
+
+        topm_k_cache = torch_npu.npu_gather_sparse_index(
+            flat_indexer_k_cache, flat_topm_k_idxs,
+        ).unsqueeze(-2)
+        topm_scale_cache = torch_npu.npu_gather_sparse_index(
+            flat_indexer_scale_cache, flat_topm_scale_idxs,
+        ).unsqueeze(-2)
+
+        topm_k_cache = torch.where(valid_topm_mask[..., None, None],
+                                    topm_k_cache, torch.zeros_like(topm_k_cache))
+        topm_scale_cache = torch.where(valid_topm_mask[..., None, None],
+                                        topm_scale_cache, torch.zeros_like(topm_scale_cache))
+
+        num_topm_blocks = topm_count // block_size
+        local_topm_block_mapping = local_block_table[
+            :num_decode_rows, :num_topm_blocks
+        ].reshape(-1, 1).to(torch.int32)
+
+        topm_k_blocks = topm_k_cache.reshape(
+            num_decode_rows * num_topm_blocks, block_size, *topm_k_cache.shape[2:],
+        )
+        topm_scale_blocks = topm_scale_cache.reshape(
+            num_decode_rows * num_topm_blocks, block_size, *topm_scale_cache.shape[2:],
+        )
+
+        torch.ops._C_ascend.npu_scatter_nd_update_v2(
+            indexer_local_k_cache, local_topm_block_mapping, topm_k_blocks,
+        )
+        torch.ops._C_ascend.npu_scatter_nd_update_v2(
+            indexer_local_scale_cache, local_topm_block_mapping, topm_scale_blocks,
+        )
+
+    def _restore_indexcache_reuse_topk_idxs(
+        self, layer_name: str, req_ids: tuple[str, ...] | None, local_topk_idxs: torch.Tensor,
+    ) -> torch.Tensor:
+        assert req_ids is not None
+        local_topk_idxs_2d = local_topk_idxs[:, 0, :].to(torch.long)
+        layer_cache = self.indexcache_topm_idx_cache[layer_name]
+        saved_topm_idxs = torch.stack(
+            [layer_cache[req_id].to(local_topk_idxs_2d.device) for req_id in req_ids], dim=0,
+        )
+        valid_topk_mask = local_topk_idxs_2d >= 0
+        safe_local_topk_idxs = local_topk_idxs_2d.clamp_min(0)
+        global_topk_idxs = torch.gather(saved_topm_idxs, 1, safe_local_topk_idxs)
+        global_topk_idxs = torch.where(
+            valid_topk_mask, global_topk_idxs, torch.full_like(global_topk_idxs, -1),
+        )
+        return global_topk_idxs[:, None, :].to(local_topk_idxs.dtype)
