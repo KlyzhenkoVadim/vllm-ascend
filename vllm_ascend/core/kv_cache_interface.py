@@ -9,10 +9,15 @@ from vllm.config import VllmConfig
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.core.single_type_kv_cache_manager import SlidingWindowManager
-from vllm.v1.kv_cache_interface import FullAttentionSpec, MLAAttentionSpec, SlidingWindowMLASpec
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    FullAttentionSpec,
+    MLAAttentionSpec,
+    SlidingWindowMLASpec,
+)
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 
-from vllm_ascend.core.single_type_kv_cache_manager import CompressAttentionManager
+from vllm_ascend.core.single_type_kv_cache_manager import CompressAttentionManager, FixedCacheManager
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
 
@@ -134,7 +139,7 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
             total_virtual_head_dim = sum(virtual_dims)
 
             if virtual_dims[1] == 0:
-                # A5: ckv merged (kv_lora + k_rope + scale) → 3-tensor
+                # A5: ckv merged (kv_lora + k_rope + scale) -> 3-tensor
                 return (
                     total_virtual_head_dim / virtual_dims[0],  # kv_cache[0]: ckv
                     total_virtual_head_dim / virtual_dims[2],  # kv_cache[1]: qli
@@ -246,6 +251,109 @@ class AscendSlidingWindowMLASpec(SlidingWindowMLASpec):
         )
 
 
+@dataclass(frozen=True, kw_only=True)
+class AscendFixedCacheSpec(FullAttentionSpec):
+    head_size_v: int = None  # type: ignore[assignment]
+    cache_dtype_str: str | None = None
+    alignment: int | None = None
+    compress_ratio: int = 1
+    model_version: str | None = None
+    fixed_token_lengths: int = 2048
+    attention_chunk_size: int | None = None
+    scale_dim: int = 0
+    scale_dtype: torch.dtype = torch.int8
+    cache_sparse_c8: bool = False
+    c8_k_cache_dtype: torch.dtype = torch.int8
+    c8_k_scale_cache_dtype: torch.dtype = torch.float16
+
+    def __post_init__(self):
+        if self.head_size_v is None:
+            object.__setattr__(self, "head_size_v", self.head_size)
+
+        if self.alignment is not None:
+            actual_page_size = self.real_page_size_bytes
+            padding = self.alignment - (actual_page_size % self.alignment)
+            if padding != self.alignment:
+                object.__setattr__(self, "page_size_padded", actual_page_size + padding)
+
+    @property
+    def storage_block_size(self) -> int:
+        return self.block_size // self.compress_ratio
+
+    # def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
+    #     return cdiv(self.fixed_token_lengths, self.block_size) * self.page_size_bytes
+
+    @property
+    def page_size_bytes(self) -> int:
+        if self.cache_sparse_c8:
+            num_heads_per_page = self.block_size * self.num_kv_heads
+            # kv_cache[0]: int8
+            index_head_dim = self.sparse_head_dim[-1]
+            indexer_k_bytes = num_heads_per_page * index_head_dim * get_dtype_size(self.c8_k_cache_dtype)
+            # kv_cache[1]: float16
+            # since the scale is stored per token, head_dim is set to 1.
+            index_scale_head_dim = 1
+            indexer_k_scale_bytes = (
+                num_heads_per_page * index_scale_head_dim * get_dtype_size(self.c8_k_scale_cache_dtype)
+            )
+            return indexer_k_bytes + indexer_k_scale_bytes
+
+        return (
+            self.block_size
+            * self.num_kv_heads
+            * (self.head_size * get_dtype_size(self.dtype) + self.scale_dim * get_dtype_size(self.scale_dtype))
+        )
+
+    @property
+    def real_page_size_bytes(self) -> int:
+        if self.cache_dtype_str == "fp8_ds_mla":
+            if self.model_version == "deepseek_v4":
+                return self.storage_block_size * 584
+            return self.block_size * 656
+        return (
+            self.storage_block_size
+            * self.num_kv_heads
+            * self.head_size
+            * get_dtype_size(self.dtype)
+        )
+
+    def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
+        return cdiv(self.fixed_token_lengths, self.block_size * self.compress_ratio) * self.page_size_bytes
+
+    @classmethod
+    def merge(cls, specs: list[Self]) -> Self:
+        assert all(isinstance(spec, AscendFixedCacheSpec) for spec in specs), (
+            "All indexer local cache of attention layers in the same KV cache group must be FixedCacheSpec."
+        )
+        cache_dtype_str_set = set(spec.cache_dtype_str for spec in specs)
+        compress_ratio_set = set(spec.compress_ratio for spec in specs)
+        model_version_set = set(spec.model_version for spec in specs)
+        assert (
+            len(cache_dtype_str_set) == 1
+            and len(compress_ratio_set) == 1
+            and len(model_version_set) == 1
+        ), (
+            "All attention layers in the same KV cache group must use the same "
+            "quantization method, compress ratio, and model version."
+        )
+        return cls(
+            block_size=specs[0].block_size,
+            num_kv_heads=specs[0].num_kv_heads,
+            head_size=specs[0].head_size,
+            dtype=specs[0].dtype,
+            kv_quant_mode=specs[0].kv_quant_mode,
+            page_size_padded=specs[0].page_size_padded,
+            cache_dtype_str=cache_dtype_str_set.pop(),
+            compress_ratio=compress_ratio_set.pop(),
+            model_version=model_version_set.pop(),
+        )
+
+
+# Register FixedCacheSpec in upstream vllm so it's importable by patches
+# import vllm.v1.kv_cache_interface as _kvcif
+# _kvcif.FixedCacheSpec = FixedCacheSpec  # type: ignore[attr-defined]
+
+
 def register_ascend_kv_cache_specs() -> None:
     KVCacheSpecRegistry.register(
         kvcache_spec_cls=AscendMLAAttentionSpec,
@@ -257,3 +365,9 @@ def register_ascend_kv_cache_specs() -> None:
         manager_class=SlidingWindowManager,
         uniform_type_base_spec=SlidingWindowMLASpec,
     )
+    KVCacheSpecRegistry.register(
+        kvcache_spec_cls=AscendFixedCacheSpec,
+        manager_class=FixedCacheManager,
+        uniform_type_base_spec=FullAttentionSpec
+    )
+    #TODO(KlyzhenkoVadim): Add FixedCache HERE!

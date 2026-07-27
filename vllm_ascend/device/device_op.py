@@ -630,8 +630,9 @@ class BaseDeviceAdaptor:
         """Unpack indexer kv_cache tuple.
         Non-A5: returns (state_cache, k_cache, scale_cache, None).
         A5: returns (state_cache, k_cache, scale_cache, full_cache)."""
-        _, _, _, indexer_state_cache, indexer_k_cache, indexer_scale_cache = kv_cache
-        return indexer_state_cache, indexer_k_cache, indexer_scale_cache, None
+        #TODO(KlyzhenkoVadim): Adapt it both for baseline and local_k_cache
+        _, _, _, indexer_state_cache, indexer_k_cache, indexer_scale_cache, indexer_local_k_cache, indexer_local_scale_cache = kv_cache
+        return indexer_state_cache, indexer_k_cache, indexer_scale_cache, None, indexer_local_k_cache, indexer_local_scale_cache
 
     @staticmethod
     def unpack_dsa_forward_kv_cache(kv_cache, compress_ratio):
@@ -641,15 +642,16 @@ class BaseDeviceAdaptor:
         Non-A5: indexer_full_cache is always None.
         All devices: unused slots are None.
         """
-        idx_full = 6  # 7th element (indexer_full_cache), A5 only
+        #TODO(KlyzhenkoVadim): Adapt it both for baseline and local_k_cache
+        idx_full = 8 #6  # 7th element (indexer_full_cache), A5 only
         full_cache = kv_cache[idx_full] if len(kv_cache) > idx_full else None
         if compress_ratio == 4:
             # [0]=compress, [1]=swa, [2]=state, [3]=unused, [4]=ik, [5]=isc
-            return (kv_cache[0], kv_cache[1], kv_cache[2], kv_cache[4], kv_cache[5], full_cache)
+            return (kv_cache[0], kv_cache[1], kv_cache[2], kv_cache[4], kv_cache[5], full_cache, kv_cache[6], kv_cache[7])
         elif compress_ratio == 128:
-            return (kv_cache[0], kv_cache[1], kv_cache[2], None, None, full_cache)
+            return (kv_cache[0], kv_cache[1], kv_cache[2], None, None, full_cache, None, None)
         else:
-            return (None, kv_cache[1], None, None, None, full_cache)
+            return (None, kv_cache[1], None, None, None, full_cache, None, None)
 
     @staticmethod
     def pad_dsa_decode_slot_mapping(slot_mapping, num_decode_tokens, compress_ratio, num_decodes):

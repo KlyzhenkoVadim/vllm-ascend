@@ -366,6 +366,8 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                     num_blocks = curr_hit_length // effective_block_size
                     curr_hit_length = num_blocks * effective_block_size
                     continue
+                '''To be considered'''
+                '''Fixed Cache Prefix Mechanism'''
 
                 use_eagle = idx in self.eagle_attn_group_indices and idx not in eagle_verified
 

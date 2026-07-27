@@ -27,6 +27,7 @@ import math
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
+import re
 
 import torch
 import torch.nn.functional as F
@@ -73,7 +74,7 @@ from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache as Vllm
 from vllm.v1.kv_cache_interface import KVCacheSpec
 
 from vllm_ascend.ascend_config import get_ascend_config
-from vllm_ascend.core.kv_cache_interface import AscendSlidingWindowMLASpec
+from vllm_ascend.core.kv_cache_interface import AscendSlidingWindowMLASpec, AscendFixedCacheSpec
 from vllm_ascend.ops.dsa import AscendDeepseekSparseAttention, DSAModules
 from vllm_ascend.ops.rope_dsv4 import ComplexExpRotaryEmbedding
 from vllm_ascend.ops.triton.mul_add import muls_add_triton
@@ -169,6 +170,37 @@ class AscendDeepseekV4IndexerCache(DeepseekV4IndexerCache):
     def get_attn_backend(self):
         return _get_ascend_dsa_backend()
 
+class AscendDeepseekV4IndexerLocalCache(DeepseekV4IndexerCache):
+    def __init__(
+        self,
+        head_dim: int,
+        dtype: torch.dtype,
+        prefix: str,
+        cache_config: CacheConfig,
+        compress_ratio: int = 1,
+    ):
+        super().__init__(head_dim, dtype, prefix, cache_config, compress_ratio)
+
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+        # head_dim already carries the fp8 scale padding
+        # compress_ratio=1 for V3.2, >1 for DeepseekV4; both use the same cache layout.
+        return AscendFixedCacheSpec(
+            block_size=_dsv4_block_sizes()[vllm_config.cache_config.block_size][0][0],
+            num_kv_heads=1,
+            head_size=self.head_dim,
+            dtype=self.dtype,
+            model_version="deepseek_v4",
+            compress_ratio=self.compress_ratio,
+            cache_dtype_str=self.cache_config.cache_dtype,
+            scale_dim=1 if self.head_dim == 128 else 0,
+            scale_dtype=torch.float16,
+            fixed_token_lengths=get_ascend_config().indexcache_buffer_len,
+        )
+
+    def forward(self): ...
+
+    def get_attn_backend(self):
+        return _get_ascend_dsa_backend()
 
 class AscendDeepseekV4SWACache(VllmDeepseekV4SWACache):
     def __init__(
@@ -560,6 +592,9 @@ class Indexer(nn.Module):
         ascend_device_type = get_ascend_device_type()
         k_dtype = torch.float8_e4m3fn if ascend_device_type == AscendDeviceType.A5 else torch.int8
 
+        ascend_config = get_ascend_config()
+        self.enable_local_k_cache = ascend_config.enable_local_k_cache
+
         if self.compress_ratio == 4:
             # TODO(cmq): change the dtype of cache
             self.k_cache = AscendDeepseekV4IndexerCache(
@@ -569,6 +604,16 @@ class Indexer(nn.Module):
                 cache_config=cache_config,
                 compress_ratio=self.compress_ratio,
             )
+
+            if self.enable_local_k_cache:
+                self.local_k_cache = AscendDeepseekV4IndexerLocalCache(
+                    head_dim=self.head_dim,
+                    dtype=k_dtype,
+                    prefix=f"{prefix}.local_k_cache",
+                    cache_config=cache_config,
+                    compress_ratio=self.compress_ratio,
+                )
+
         self.compressor = None
         if self.compress_ratio > 1:
             self.compressor = Compressor(
@@ -1008,6 +1053,8 @@ class DeepseekV4Model(nn.Module):
 
         self.vocab_size = config.vocab_size
         self.is_v32 = hasattr(config, "index_topk")
+        #TODO(klyzhenko-vadim): Have a check this logic
+        #DSV4 creates indices buffer inside model.
         if self.is_v32:
             topk_tokens = config.index_topk
             topk_indices_buffer = torch.empty(
@@ -1328,6 +1375,11 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
             if not name.startswith("model"):
                 name = f"model.{name}"
 
+            m=re.match(r'model\.layers\.(\d+)\.', name)
+            if m and int(m.group(1)) >= self.config.num_hidden_layers:
+                continue
+            if "mtp" in name:
+                continue
             if ".w1." in name:
                 name = name.replace(".w1.", ".gate_proj.")
             if ".w2." in name:
