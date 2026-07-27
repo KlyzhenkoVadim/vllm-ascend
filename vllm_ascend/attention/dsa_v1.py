@@ -31,7 +31,7 @@ from vllm_ascend.utils import (
     npu_stream_switch,
     olora_tp_enable,
 )
-from vllm_ascend.worker.npu_input_batch import NPUInputBatch
+from vllm_ascend.worker.npu_input_batch import NPUInputBatch, TopMReqState
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -245,6 +245,10 @@ class AscendDSAPrefillMetadata:
     qli_metadata: torch.Tensor = None
     cu_c4_cmp_seqlen_list: torch.Tensor = None
     cu_c128_cmp_seqlen_list: torch.Tensor = None
+    topm_idxs: torch.Tensor = None  # [T, 1, index_topm] — topM indices for prefill chunk
+    topm_num_blocks: int = 0        # number of topM blocks in composite block_table
+    topm_unique_logical: torch.Tensor = None  # unique original logical blocks for topM section
+    topm_chunk_start_logical: int = 0         # original logical block where current chunk starts
 
 @dataclass
 class TopMSubgroupMetadata:
@@ -764,6 +768,16 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         n_local_heads = self.model_config.hf_config.num_attention_heads // tp_size
         index_topk = self.model_config.hf_config.index_topk
 
+        # --- topM prefill: config ---
+        index_topm = None
+        micro_step_num = None
+        local_k_cache_config = self.vllm_config.additional_config.get("local_k_cache_config", {})
+        index_topm = local_k_cache_config.get("index_topm", None)
+        micro_step_num = local_k_cache_config.get("micro_step_num", None)
+        has_topm = (input_batch is not None and self.compressor_ratio == 4
+                    and index_topm is not None and micro_step_num is not None)
+        topm_idxs_prefill = None
+
         cu_c4_cmp_seqlen_list = None
         cu_c128_cmp_seqlen_list = None
 
@@ -850,9 +864,38 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 )
             sas_metadata = self.prefill_ratio_to_sas_metadata[layer_name]
         if self.prefill_ratio_to_sas_metadata.get("qli") is None:
+            kvlens_key = self.seq_lens[reqs_start:].clone()
+            max_seqlen_k = self.seq_lens[reqs_start:].max().item()
+
+            if has_topm:
+                B = num_prefill
+                device = self.seqused_q.device
+
+                if common_attn_metadata._seq_lens_cpu is not None:
+                    _sl_cpu = common_attn_metadata._seq_lens_cpu
+                elif common_attn_metadata.seq_lens_cpu is not None:
+                    _sl_cpu = common_attn_metadata.seq_lens_cpu
+                else:
+                    _sl_cpu = common_attn_metadata.seq_lens.cpu()
+                seq_lens_np = _sl_cpu[reqs_start : reqs_start + B].numpy()
+                actual_qlens = prefill_query_start_loc_cpu[1:] - prefill_query_start_loc_cpu[:-1]
+
+                topm_idxs_prefill, kvlens_key, _block_table, max_seqlen_k, _has_cached, num_topm_blocks, topm_unique_logical, chunk_start_logical = \
+                    self._build_topm_subgroups_prefill(
+                        input_batch=input_batch,
+                        layer_name=layer_name,
+                        seq_lens_np=seq_lens_np,
+                        kvlens=self.seq_lens[reqs_start:],
+                        actual_qlens=actual_qlens,
+                        block_table=self.block_table[reqs_start:, ...],
+                        index_topm=index_topm,
+                        index_topk=index_topk,
+                        micro_step_num=micro_step_num,
+                    )
+
             self.prefill_ratio_to_sas_metadata["qli"] = torch.ops._C_ascend.npu_vllm_quant_lightning_indexer_metadata(
                 actual_seq_lengths_query=prefill_query_start_loc[1:].clone(),
-                actual_seq_lengths_key=self.seq_lens[reqs_start:].clone(),
+                actual_seq_lengths_key=kvlens_key,
                 num_heads_q=self.model_config.hf_config.index_n_heads,  # 64
                 num_heads_k=1,
                 head_dim=self.model_config.hf_config.index_head_dim,  # 128
@@ -860,10 +903,10 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 key_quant_mode=0,
                 batch_size=len(self.seq_lens[reqs_start:]),
                 max_seqlen_q=seq_lens_q.max().item(),
-                max_seqlen_k=self.seq_lens[reqs_start:].max().item(),
+                max_seqlen_k=max_seqlen_k,
                 layout_query="TND",
                 layout_key="PA_BSND",
-                sparse_count=self.model_config.hf_config.index_topk,  # 512
+                sparse_count=index_topm if has_topm else index_topk,
                 sparse_mode=3,
                 pre_tokens=(1 << 63) - 1,
                 next_tokens=(1 << 63) - 1,
@@ -892,6 +935,10 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             qli_metadata=qli_metadata,
             cu_c4_cmp_seqlen_list=cu_c4_cmp_seqlen_list,
             cu_c128_cmp_seqlen_list=cu_c128_cmp_seqlen_list,
+            topm_idxs=topm_idxs_prefill,
+            topm_num_blocks=num_topm_blocks,
+            topm_unique_logical=topm_unique_logical,
+            topm_chunk_start_logical=chunk_start_logical,
         )
 
     def build_decode_metadata(
@@ -1624,6 +1671,82 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 topm_idxs=topm_idxs[reuse_indices],
             )
         return default_metadata, compute_topm_metadata, reuse_metadata
+
+    def _build_topm_subgroups_prefill(self, input_batch, layer_name, seq_lens_np,
+                                       kvlens, actual_qlens, block_table,
+                                       index_topm, index_topk, micro_step_num):
+        """[PREFILL] Compute topm bookkeeping + composite block_table for prefill chunks.
+
+        - Reads CPU state (input_batch.topm_state).
+        - If state has cached topm_idxs: builds composite block_table
+          (topM blocks + current chunk blocks), limits kvlens.
+        - If first chunk: returns full context as-is.
+        Returns: topm_idxs, actual_seq_lengths_key, block_table, max_seqlen_k, has_cached.
+        """
+        B = len(kvlens)
+        device = kvlens.device
+        req_ids = input_batch.req_ids[:B]
+        block_size = 32
+
+        topm_idxs = torch.zeros(B, 1, index_topm, dtype=torch.int32, device=device)
+        actual_seq_lengths_key = kvlens.clone()
+        max_seqlen_k = int(actual_seq_lengths_key.max().item())
+        has_cached = False
+
+        num_topm_blocks = 0
+        topm_unique_logical = None
+        chunk_start_logical = 0
+
+        for i, rid in enumerate(req_ids):
+            if rid is None:
+                continue
+            state = input_batch.topm_state.get(rid, {}).get(layer_name)
+            kvlen = int(seq_lens_np[i])
+            act_qlen = int(actual_qlens[i])
+            short = kvlen < 4 * index_topm
+
+            if state is None:
+                if short:
+                    continue
+                state = input_batch.topm_state.setdefault(rid, {}).setdefault(
+                    layer_name, TopMReqState())
+
+            if not state.start_cache and not short:
+                state.start_cache = True
+                state.ustep = 0
+
+            if state.topm_idxs is not None:
+                has_cached = True
+                topm_idxs[i] = state.topm_idxs
+
+                topm_logical = state.topm_idxs // block_size
+                topm_unique_blocks = torch.unique(topm_logical)
+                topm_unique_logical = topm_unique_blocks
+                global_bt = block_table[i].long()
+                topm_physical = global_bt[topm_unique_blocks]
+
+                num_topm_blocks = topm_physical.numel()
+                num_prev_blocks = cdiv(kvlen, block_size)
+                num_chunk_blocks = cdiv(act_qlen, block_size)
+                chunk_start_logical = num_prev_blocks - num_chunk_blocks
+                chunk_physical = global_bt[chunk_start_logical : chunk_start_logical + num_chunk_blocks]
+
+                composite = torch.cat([topm_physical, chunk_physical], dim=0)
+                num_composite = composite.numel()
+                pad = block_table.shape[1] - num_composite
+                if pad > 0:
+                    composite_padded = torch.nn.functional.pad(composite, (0, pad), value=0)
+                else:
+                    composite_padded = composite[:block_table.shape[1]]
+
+                new_kvlen = num_topm_blocks * block_size + act_qlen
+                actual_seq_lengths_key[i] = new_kvlen
+                block_table[i] = composite_padded.to(block_table.dtype)
+
+            state.ustep += 1
+            max_seqlen_k = max(max_seqlen_k, int(actual_seq_lengths_key[i].item()))
+
+        return topm_idxs, actual_seq_lengths_key, block_table, max_seqlen_k, has_cached, num_topm_blocks, topm_unique_logical, chunk_start_logical
 
     def _remap_qlens(self, orig_qlens, mask):
         """
@@ -2763,6 +2886,33 @@ class AscendDSAImpl(DSAAttentionImpl):
             q, kv, indexer_k_cache, indexer_scale_cache, indexer_full_cache, slot_mapping
         )
 
+    def _remap_composite_to_original(
+        self,
+        topk_idxs_comp: torch.Tensor,
+        num_topm_blocks: int,
+        topm_unique_logical: torch.Tensor,
+        chunk_start_logical: int,
+        block_size: int = 32,
+    ) -> torch.Tensor:
+        """Remap QLI output from composite address space to original address space.
+
+        Composite layout: [topM_blocks (0..num_topm_blocks-1) | chunk_blocks]
+        Mapping:
+          composite block < n_topm: original_blk = unique_logical[composite_blk]
+          composite block >= n_topm: original_blk = chunk_start + (composite_blk - n_topm)
+        """
+        n_topm = num_topm_blocks
+        blks = topk_idxs_comp // block_size
+        offs = topk_idxs_comp % block_size
+
+        topm_mask = blks < n_topm
+        topm_gather_idx = blks.clamp(0, n_topm - 1).long()
+        topm_orig_blks = topm_unique_logical[topm_gather_idx]
+        chunk_orig_blks = chunk_start_logical + (blks - n_topm)
+
+        orig_blks = torch.where(topm_mask, topm_orig_blks, chunk_orig_blks)
+        return orig_blks * block_size + offs
+
     def _indexer_qli(
         self,
         q: torch.Tensor,
@@ -2775,10 +2925,15 @@ class AscendDSAImpl(DSAAttentionImpl):
     ):
         if with_prefill:
             assert indexer_kv_scale_metadata.prefill is not None
-            qlens = indexer_kv_scale_metadata.prefill.query_start_loc[1:]
-            kvlens = indexer_kv_scale_metadata.prefill.seq_lens
-            block_table = indexer_kv_scale_metadata.prefill.block_table
-            qli_metadata = indexer_kv_scale_metadata.prefill.qli_metadata
+            prefill_meta = indexer_kv_scale_metadata.prefill
+            qlens = prefill_meta.query_start_loc[1:]
+            kvlens = prefill_meta.seq_lens
+            block_table = prefill_meta.block_table
+            qli_metadata = prefill_meta.qli_metadata
+
+            use_topm = self.index_topm is not None and self.compress_ratio == 4
+            qli_sparse_count = self.index_topm if use_topm else self.index_topk
+
             topk_idxs, _ = torch.ops._C_ascend.npu_vllm_quant_lightning_indexer(
                 query=q,
                 key=indexer_k_cache, # (num_slots, block_size, 1(?), head_dim(128))
@@ -2793,13 +2948,25 @@ class AscendDSAImpl(DSAAttentionImpl):
                 key_quant_mode=0,
                 layout_query="TND",
                 layout_key="PA_BSND",
-                sparse_count=self.index_topk,
+                sparse_count=qli_sparse_count,
                 sparse_mode=3,
                 pre_tokens=(1 << 63) - 1,
                 next_tokens=(1 << 63) - 1,
                 cmp_ratio=4,
                 return_value=False,
-                ) # topk_idsx < 512
+            )
+
+            if use_topm:
+                if prefill_meta.topm_num_blocks > 0:
+                    topk_idxs = self._remap_composite_to_original(
+                        topk_idxs,
+                        prefill_meta.topm_num_blocks,
+                        prefill_meta.topm_unique_logical,
+                        prefill_meta.topm_chunk_start_logical,
+                    )
+                prefill_meta.topm_idxs = topk_idxs  # original addresses
+                topk_idxs = topk_idxs[:, :, :self.index_topk]
+            # else: topk_idxs already (T, 1, index_topk) — no slicing needed
         else:
             #NOTE: kvlens: [B], qlens: [B] (все 1 на decode)
             # We have three states:
@@ -3154,3 +3321,33 @@ class AscendDSAImpl(DSAAttentionImpl):
         topm_block_table = torch.arange(num_blocks, device=block_table.device).view(B, num_blocks_per_request).to(torch.int32)
 
         return (new_k, new_scale, topm_block_table) #FIXME: Do we really need this topm_block_table to compute here?!
+
+    def _prepare_k_cache_for_qli_prefill(
+        self,
+        indexer_k_cache,
+        indexer_scale_cache,
+        block_table,         # (B, max_blocks) — original
+        topm_idxs,           # (1, index_topm) — cached topm from state
+        chunk_start_logical, # logical block where current chunk starts
+        num_chunk_blocks,    # number of blocks in current chunk
+    ):
+        """Build composite [chunk | topM] k/scale caches with sequential block_table."""
+        topm_k, topm_scale, _ = self._prepare_k_cache_for_qli(
+            indexer_k_cache, indexer_scale_cache,
+            block_table[:1],
+            topm_idxs,
+        )
+        num_topm_blocks = topm_k.shape[0]
+        chunk_phys = block_table[0, chunk_start_logical : chunk_start_logical + num_chunk_blocks].long()
+        chunk_k = indexer_k_cache[chunk_phys]
+        chunk_scale = indexer_scale_cache[chunk_phys]
+
+        composite_k = torch.cat([chunk_k, topm_k], dim=0)
+        composite_scale = torch.cat([chunk_scale, topm_scale], dim=0)
+        num_composite = composite_k.shape[0]
+
+        B = block_table.shape[0]
+        composite_bt = torch.arange(num_composite, device=block_table.device,
+                                    dtype=block_table.dtype).expand(B, -1)
+        new_kvlens = num_composite * 32
+        return composite_k, composite_scale, composite_bt, new_kvlens, num_topm_blocks

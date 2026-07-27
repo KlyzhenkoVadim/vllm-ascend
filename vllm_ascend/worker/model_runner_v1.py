@@ -2327,6 +2327,16 @@ class NPUModelRunner(GPUModelRunner):
                             ).setdefault(layer_name, TopMReqState())
                             layer_state.topm_idxs = decode.topm_idxs[i].clone()
 
+                    prefill = getattr(meta, 'prefill', None)
+                    if prefill is not None and prefill.topm_idxs is not None:
+                        last_token_topm = prefill.topm_idxs[-1].clone()
+                        for rid in self.input_batch.req_ids:
+                            if rid is None:
+                                continue
+                            layer_state = self.input_batch.topm_state.get(rid, {}).get(layer_name)
+                            if layer_state is not None:
+                                layer_state.topm_idxs = last_token_topm.clone()
+
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs:
