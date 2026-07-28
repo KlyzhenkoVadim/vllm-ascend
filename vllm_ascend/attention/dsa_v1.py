@@ -3448,12 +3448,20 @@ class AscendDSAImpl(DSAAttentionImpl):
         num_topm_blocks = topm_k.shape[0]
         num_chunk_blocks = cdiv(act_qlen, block_size)
         chunk_phys = block_table[0, chunk_start_logical : chunk_start_logical + num_chunk_blocks].long()
-        chunk_k = indexer_k_cache[chunk_phys].contiguous()
-        chunk_scale = indexer_scale_cache[chunk_phys].contiguous()
+        chunk_k = indexer_k_cache[chunk_phys]
+        chunk_scale = indexer_scale_cache[chunk_phys]
 
-        composite_k = torch.cat([topm_k.contiguous(), chunk_k], dim=0)
-        composite_scale = torch.cat([topm_scale.contiguous(), chunk_scale], dim=0)
-        num_composite = composite_k.shape[0]
+        num_composite = num_topm_blocks + num_chunk_blocks
+        head_dim = indexer_k_cache.shape[-1]
+        composite_k = torch.zeros(num_composite, block_size, 1, head_dim,
+                                  dtype=indexer_k_cache.dtype, device=indexer_k_cache.device)
+        composite_scale = torch.zeros(num_composite, block_size, 1, 1,
+                                      dtype=indexer_scale_cache.dtype, device=indexer_scale_cache.device)
+
+        composite_k[:num_topm_blocks] = topm_k
+        composite_k[num_topm_blocks:] = chunk_k
+        composite_scale[:num_topm_blocks] = topm_scale
+        composite_scale[num_topm_blocks:] = chunk_scale
 
         B = block_table.shape[0]
         composite_bt = torch.arange(num_composite, device=block_table.device,
