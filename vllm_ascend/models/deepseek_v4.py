@@ -27,6 +27,7 @@ import math
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
+import re
 
 import torch
 import torch.nn.functional as F
@@ -843,6 +844,14 @@ class DeepseekV4Attention(nn.Module):
                 if 0 <= indexer_seq_idx < len(pattern):
                     skip_topk = pattern[indexer_seq_idx] == "S"
 
+        #TODO(KlyzhenkoVadim): Have a check the correctness.
+        index_topm = None
+        micro_step_num = None
+        local_k_cache_config = vllm_config.additional_config.get("local_k_cache_config", None)
+        if self.compress_ratio == 4 and local_k_cache_config is not None and ".mtp." not in prefix:
+            index_topm = local_k_cache_config.get("index_topm", None)
+            micro_step_num = local_k_cache_config.get("micro_step_num", None)
+
         ascend_device_type = get_ascend_device_type()
         k_dtype = torch.float8_e4m3fn if ascend_device_type == AscendDeviceType.A5 else torch.bfloat16
         swa_cache_layer = AscendDeepseekV4SWACache(
@@ -868,6 +877,8 @@ class DeepseekV4Attention(nn.Module):
             swa_cache_layer=swa_cache_layer,
             topk_indices_buffer=topk_indices_buffer,
             skip_topk=skip_topk,
+            index_topm=index_topm,
+            micro_step_num=micro_step_num
         )
 
         self.dsa_attn = AscendDeepseekSparseAttention(
@@ -1008,6 +1019,8 @@ class DeepseekV4Model(nn.Module):
 
         self.vocab_size = config.vocab_size
         self.is_v32 = hasattr(config, "index_topk")
+        #TODO(KlyzhenkoVadim): Have a check this logic
+        #DSV4 creates indices buffer inside model.
         if self.is_v32:
             topk_tokens = config.index_topk
             topk_indices_buffer = torch.empty(
@@ -1327,7 +1340,12 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
             # TODO:
             if not name.startswith("model"):
                 name = f"model.{name}"
-
+            
+            m=re.match(r'model\.layers\.(\d+)\.', name)
+            if m and int(m.group(1)) >= self.config.num_hidden_layers:
+                continue
+            if "mtp" in name:
+                continue
             if ".w1." in name:
                 name = name.replace(".w1.", ".gate_proj.")
             if ".w2." in name:

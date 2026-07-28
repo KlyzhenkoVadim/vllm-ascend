@@ -158,7 +158,7 @@ from vllm_ascend.utils import (
     set_weight_prefetch_method,
     should_skip_allreduce_across_dp_group,
 )
-from vllm_ascend.worker.npu_input_batch import NPUInputBatch
+from vllm_ascend.worker.npu_input_batch import NPUInputBatch, TopMReqState
 from vllm_ascend.worker.pcp_utils import PCPManager
 from vllm_ascend.worker.utils import AscendKVBlockZeroer
 
@@ -2313,6 +2313,36 @@ class NPUModelRunner(GPUModelRunner):
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
+            # Sync topM state back from decode temp buffers to input_batch.topm_state
+            #TODO(KlyzhenkoVadim): Why do we need this here?!
+            if not use_spec_decode and attn_metadata is not None:
+                # for ub_meta in attn_metadata:
+                #TODO(KlyzhenkoVadim): Have a check 
+                for layer_name, meta in attn_metadata.items():
+                    decode = getattr(meta, 'decode', None)
+                    if decode is not None and decode.topm_idxs is not None:
+                        B = decode.topm_idxs.shape[0]
+                        for i, rid in enumerate(self.input_batch.req_ids[:B]):
+                            if rid is None:
+                                continue
+                            layer_state = self.input_batch.topm_state.setdefault(
+                                rid, {}
+                            ).setdefault(layer_name, TopMReqState())
+                            #TODO(KlyzhenkoVadim): We don't need to set topm_idxs
+                            #if decode.topm_idxs[i] is zeros_like!!!
+                            #TODO(KlyzhenkoVadim): Try to use 
+                            layer_state.topm_idxs = decode.topm_idxs[i].clone()
+
+                    prefill = getattr(meta, 'prefill', None)
+                    if prefill is not None and prefill.topm_idxs is not None:
+                        last_token_topm = prefill.topm_idxs[-1].clone()
+                        for rid in self.input_batch.req_ids:
+                            if rid is None:
+                                continue
+                            layer_state = self.input_batch.topm_state.get(rid, {}).get(layer_name)
+                            if layer_state is not None:
+                                layer_state.topm_idxs = last_token_topm.clone()
+
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs:
@@ -3228,11 +3258,16 @@ class NPUModelRunner(GPUModelRunner):
                     num_decode_draft_tokens_cpu=self.num_decode_draft_tokens.cpu[:num_reqs_padded],
                 )
 
+            #TODO(KlyzhenkoVadim): Have a check. It could be a problem...
+            # It's okay...
+            #attn_group.layer_names
+            #['model.layers.2.self_attn.indexer.k_cache']
             if isinstance(builder, (AscendDSAMetadataBuilder, AscendDSACPMetadataBuilder)):
                 compress_ratio = getattr(attn_group.kv_cache_spec, "compress_ratio", 1)
                 if for_cudagraph_capture:
                     extra_attn_metadata_args = dict(
                         compress_ratio=compress_ratio,
+                        # input_batch=self.input_batch, #TODO(KlyzhenkoVadim): Have a check!
                         prefill_ratio_to_sas_metadata=dict(),
                         decode_ratio_to_sas_metadata=dict(),
                         common_ratio_to_sas_metadata=dict(),
@@ -3241,12 +3276,15 @@ class NPUModelRunner(GPUModelRunner):
                 else:
                     extra_attn_metadata_args = dict(
                         compress_ratio=compress_ratio,
+                        # input_batch=self.input_batch,
                         num_reqs_actual=num_reqs_actual,
                         prefill_ratio_to_sas_metadata=prefill_ratio_to_sas_metadata,
                         decode_ratio_to_sas_metadata=decode_ratio_to_sas_metadata,
                         common_ratio_to_sas_metadata=common_ratio_to_sas_metadata,
                         block_size=attn_group.kv_cache_spec.block_size,
                         )
+                    if "indexer.k_cache" in attn_group.layer_names[0]:
+                        extra_attn_metadata_args["input_batch"] = self.input_batch
 
             # add kvcomp_metadata into common_attn_metadata
             if (for_cudagraph_capture
