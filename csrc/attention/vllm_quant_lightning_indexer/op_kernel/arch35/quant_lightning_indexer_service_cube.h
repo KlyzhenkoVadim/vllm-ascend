@@ -34,7 +34,8 @@ public:
     __aicore__ inline QLIMatmul(){};
     __aicore__ inline void InitBuffers(TPipe *pipe);
     __aicore__ inline void InitMm1GlobalTensor(const GlobalTensor<int32_t> &blkTableGm, const GlobalTensor<K_T> &keyGm,
-                                               const GlobalTensor<Q_T> &queryGm);
+                                               const GlobalTensor<Q_T> &queryGm,
+                                               const GlobalTensor<int32_t> &topmIdxsGm);
     __aicore__ inline void InitParams(const ConstInfo &constInfo);
     __aicore__ inline void AllocEventID();
     __aicore__ inline void FreeEventID();
@@ -82,6 +83,7 @@ protected:
     __aicore__ inline void KeyNd2Nz(uint64_t s2L1RealSize, uint64_t s2GmOffset, const QLICommon::RunInfo &runInfo);
     __aicore__ inline void KeyNd2NzForPA(uint64_t s2L1RealSize, uint64_t s2GmOffset, const QLICommon::RunInfo &runInfo);
     GlobalTensor<int32_t> blkTableGm_;
+    GlobalTensor<int32_t> topmIdxsGm_;
     GlobalTensor<K_T> keyGm_;
     GlobalTensor<Q_T> queryGm_;
 
@@ -140,9 +142,11 @@ __aicore__ inline void QLIMatmul<QLIT>::InitBuffers(TPipe *pipe)
 template <typename QLIT>
 __aicore__ inline void
 QLIMatmul<QLIT>::InitMm1GlobalTensor(const GlobalTensor<int32_t> &blkTableGm, const GlobalTensor<K_T> &keyGm,
-                                   const GlobalTensor<Q_T> &queryGm)
+                                   const GlobalTensor<Q_T> &queryGm,
+                                   const GlobalTensor<int32_t> &topmIdxsGm)
 {
     blkTableGm_ = blkTableGm;
+    topmIdxsGm_ = topmIdxsGm;
     keyGm_ = keyGm;
     queryGm_ = queryGm;
 }
@@ -242,28 +246,66 @@ __aicore__ inline void QLIMatmul<QLIT>::KeyNd2NzForPA(uint64_t s2L1RealSize, uin
 {
     uint64_t s2L1Offset = 0;
     while (s2L1Offset < s2L1RealSize) {
-        uint64_t s2BlkId = (s2L1Offset + s2GmOffset) / constInfo_.kCacheBlockSize;
-        uint64_t s2BlkOffset = (s2L1Offset + s2GmOffset) % constInfo_.kCacheBlockSize;
-        uint64_t keyGmOffset = blkTableGm_.GetValue(runInfo.bIdx * constInfo_.maxBlockNumPerBatch + s2BlkId) *
-                                   constInfo_.stride +
-                               s2BlkOffset * constInfo_.headDim;
-
-        uint64_t s2Mte2Size = s2L1RealSize - s2L1Offset;
-        s2Mte2Size = s2BlkOffset + s2Mte2Size >= constInfo_.kCacheBlockSize ? constInfo_.kCacheBlockSize - s2BlkOffset
-                                                                            : s2Mte2Size;
-        Nd2NzParams nd2nzPara;
-        nd2nzPara.ndNum = 1;
-        nd2nzPara.nValue = s2Mte2Size; // 行数
-        nd2nzPara.dValue = constInfo_.headDim;
-        nd2nzPara.srcDValue = constInfo_.headDim;
-        nd2nzPara.dstNzC0Stride = CeilAlign(s2L1RealSize, (uint64_t)BLOCK_CUBE); // 对齐到16 单位block
-        nd2nzPara.dstNzNStride = 1;
-        nd2nzPara.srcNdMatrixStride = 0;
-        nd2nzPara.dstNzMatrixStride = 0;
-        DataCopy(keyL1_[(keyL1BufIdx_ % KEY_BUF_NUM) * KEY_BUFFER_OFFSET + s2L1Offset * FP8_BLOCK_CUBE],
-                 keyGm_[keyGmOffset], nd2nzPara);
-
-        s2L1Offset += s2Mte2Size;
+        uint64_t virtualPos = s2L1Offset + s2GmOffset;
+        uint64_t globalPos;
+        uint64_t s2BlkId, s2BlkOffset;
+        if (runInfo.isRemapBlock) {
+            if (virtualPos < constInfo_.topmCount) {
+                globalPos = topmIdxsGm_.GetValue(runInfo.bIdx * constInfo_.topmCount + virtualPos);
+            } else {
+                globalPos = constInfo_.chunkStartToken + (virtualPos - constInfo_.topmCount);
+            }
+            s2BlkId = globalPos / constInfo_.kCacheBlockSize;
+            s2BlkOffset = globalPos % constInfo_.kCacheBlockSize;
+            uint64_t keyGmOffset = blkTableGm_.GetValue(runInfo.bIdx * constInfo_.maxBlockNumPerBatch + s2BlkId) *
+                                       constInfo_.stride +
+                                   s2BlkOffset * constInfo_.headDim;
+            uint64_t s2Mte2Size = 1;
+            Nd2NzParams nd2nzPara;
+            nd2nzPara.ndNum = 1;
+            nd2nzPara.nValue = s2Mte2Size;
+            nd2nzPara.dValue = constInfo_.headDim;
+            nd2nzPara.srcDValue = constInfo_.headDim;
+            nd2nzPara.dstNzC0Stride = CeilAlign(s2L1RealSize, (uint64_t)BLOCK_CUBE);
+            nd2nzPara.dstNzNStride = 1;
+            nd2nzPara.srcNdMatrixStride = 0;
+            nd2nzPara.dstNzMatrixStride = 0;
+            DataCopy(keyL1_[(keyL1BufIdx_ % KEY_BUF_NUM) * KEY_BUFFER_OFFSET + s2L1Offset * FP8_BLOCK_CUBE],
+                     keyGm_[keyGmOffset], nd2nzPara);
+            s2L1Offset += 1;
+        } else {
+            /// Original path: contiguous block-table resolution
+            /// For chunk portion with remap: offset the virtual position by chunkStartToken
+            if (constInfo_.useRemap) {
+                /// Chunk portion: virtualPos >= topmCount, so globalPos = chunkStartToken + (virtualPos - topmCount)
+                /// But since we already use s2Idx-split for isRemapBlock, chunk blocks use chunk_start_logical offset
+                /// In the composite space, chunk starts at virtualPos = topmAligned (after numTopmBlocks * blockSize)
+                /// So we just need to offset by chunk_start_token - topm_aligned
+                uint64_t chunkOffset = constInfo_.chunkStartToken - constInfo_.numTopmBlocks * constInfo_.kCacheBlockSize;
+                virtualPos += chunkOffset;
+            }
+            /// Standard contiguous block-table path
+            s2BlkId = virtualPos / constInfo_.kCacheBlockSize;
+            s2BlkOffset = virtualPos % constInfo_.kCacheBlockSize;
+            uint64_t keyGmOffset = blkTableGm_.GetValue(runInfo.bIdx * constInfo_.maxBlockNumPerBatch + s2BlkId) *
+                                       constInfo_.stride +
+                                   s2BlkOffset * constInfo_.headDim;
+            uint64_t s2Mte2Size = s2L1RealSize - s2L1Offset;
+            s2Mte2Size = s2BlkOffset + s2Mte2Size >= constInfo_.kCacheBlockSize ? constInfo_.kCacheBlockSize - s2BlkOffset
+                                                                                : s2Mte2Size;
+            Nd2NzParams nd2nzPara;
+            nd2nzPara.ndNum = 1;
+            nd2nzPara.nValue = s2Mte2Size;
+            nd2nzPara.dValue = constInfo_.headDim;
+            nd2nzPara.srcDValue = constInfo_.headDim;
+            nd2nzPara.dstNzC0Stride = CeilAlign(s2L1RealSize, (uint64_t)BLOCK_CUBE);
+            nd2nzPara.dstNzNStride = 1;
+            nd2nzPara.srcNdMatrixStride = 0;
+            nd2nzPara.dstNzMatrixStride = 0;
+            DataCopy(keyL1_[(keyL1BufIdx_ % KEY_BUF_NUM) * KEY_BUFFER_OFFSET + s2L1Offset * FP8_BLOCK_CUBE],
+                     keyGm_[keyGmOffset], nd2nzPara);
+            s2L1Offset += s2Mte2Size;
+        }
     }
 }
 

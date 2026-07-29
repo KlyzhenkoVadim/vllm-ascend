@@ -53,6 +53,7 @@ constexpr uint32_t ACTUAL_SEQ_Q_INDEX = 5;
 constexpr uint32_t ACTUAL_SEQ_K_INDEX = 6;
 constexpr uint32_t BLOCK_TABLE_INDEX = 7;
 constexpr uint32_t METADATA_INDEX = 8;
+constexpr uint32_t TOPM_IDXS_INDEX = 9;
 constexpr uint32_t vllm_quant_lightning_indexer = 0;
 // Attributes Index
 constexpr uint32_t ATTR_QUERY_QUANT_MODE_INDEX = 0;
@@ -67,6 +68,8 @@ constexpr uint32_t ATTR_CMP_RATIO_INDEX = 8;
 constexpr uint32_t ATTR_RETURN_VALUES_INDEX = 9;
 constexpr uint32_t ATTR_STRIDE_INDEX = 10;
 constexpr uint32_t ATTR_SCALE_STRIDE_INDEX = 11;
+constexpr uint32_t ATTR_TOPM_COUNT_INDEX = 12;
+constexpr uint32_t ATTR_CHUNK_START_TOKEN_INDEX = 13;
 // Dim Index
 constexpr uint32_t DIM_IDX_ZERO = 0;
 constexpr uint32_t DIM_IDX_ONE = 1;
@@ -102,6 +105,8 @@ TILING_DATA_FIELD_DEF(uint32_t, batchSupperFlag)
 TILING_DATA_FIELD_DEF(uint32_t, returnValues)
 TILING_DATA_FIELD_DEF(int64_t, stride)
 TILING_DATA_FIELD_DEF(int64_t, scaleStride)
+TILING_DATA_FIELD_DEF(uint32_t, topmCount)
+TILING_DATA_FIELD_DEF(int64_t, chunkStartToken)
 END_TILING_DATA_DEF
 REGISTER_TILING_DATA_CLASS(VllmQuantLightningIndexer, QLITilingData)
 
@@ -119,6 +124,7 @@ struct QLIParaInfo {
     TilingOptionalParaInfo actualSeqLengthsK = {nullptr, nullptr};
     TilingOptionalParaInfo blockTable = {nullptr, nullptr};
     TilingOptionalParaInfo metadata = {nullptr, nullptr};
+    TilingOptionalParaInfo topmIdxs = {nullptr, nullptr};
     TilingRequiredParaInfo attenOut = {nullptr, nullptr};
 
     const int64_t *queryQuantMode = nullptr;
@@ -135,6 +141,9 @@ struct QLIParaInfo {
     const bool *returnValues = nullptr;
     const int64_t *stride = nullptr;
     const int64_t *scaleStride = nullptr;
+    TilingOptionalParaInfo topmIdxs = {nullptr, nullptr};
+    const int64_t *topmCount = nullptr;
+    const int64_t *chunkStartToken = nullptr;
 };
 
 // -----------算子Tiling入参信息类---------------
@@ -167,6 +176,9 @@ public:
     bool returnValues = false;
     int64_t stride = 1;
     int64_t scaleStride = 1;
+    bool useRemap = false;
+    uint32_t topmCount = 0;
+    int64_t chunkStartToken = 0;
     // DType
     ge::DataType inputQType = ge::DT_FLOAT16;
     ge::DataType inputKType = ge::DT_FLOAT16;

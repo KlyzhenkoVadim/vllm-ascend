@@ -128,6 +128,8 @@ void QLIInfoParser::GetOptionalInputParaInfo()
     opParamInfo_.blockTable.desc = context_->GetOptionalInputDesc(BLOCK_TABLE_INDEX);
     opParamInfo_.metadata.tensor = context_->GetOptionalInputTensor(METADATA_INDEX);
     opParamInfo_.metadata.desc = context_->GetOptionalInputDesc(METADATA_INDEX);
+    opParamInfo_.topmIdxs.tensor = context_->GetOptionalInputTensor(TOPM_IDXS_INDEX);
+    opParamInfo_.topmIdxs.desc = context_->GetOptionalInputDesc(TOPM_IDXS_INDEX);
 }
 
 void QLIInfoParser::GetInputParaInfo()
@@ -173,6 +175,8 @@ ge::graphStatus QLIInfoParser::GetAttrParaInfo()
     opParamInfo_.returnValues = attrs->GetAttrPointer<bool>(ATTR_RETURN_VALUES_INDEX);
     opParamInfo_.stride = attrs->GetAttrPointer<int64_t>(ATTR_STRIDE_INDEX);
     opParamInfo_.scaleStride = attrs->GetAttrPointer<int64_t>(ATTR_SCALE_STRIDE_INDEX);
+    opParamInfo_.topmCount = attrs->GetAttrPointer<int64_t>(ATTR_TOPM_COUNT_INDEX);
+    opParamInfo_.chunkStartToken = attrs->GetAttrPointer<int64_t>(ATTR_CHUNK_START_TOKEN_INDEX);
 
     if (opParamInfo_.layOutQuery != nullptr) {
         OP_LOGI(context_->GetNodeName(), "layout_query is:%s", opParamInfo_.layOutQuery);
@@ -809,6 +813,14 @@ void QLIInfoParser::GenerateInfo(QLITilingInfo &QLIInfo)
     QLIInfo.stride = *opParamInfo_.stride;
     QLIInfo.scaleStride = *opParamInfo_.scaleStride;
 
+    if (opParamInfo_.topmCount != nullptr) {
+        QLIInfo.topmCount = static_cast<uint32_t>(*opParamInfo_.topmCount);
+    }
+    if (opParamInfo_.chunkStartToken != nullptr) {
+        QLIInfo.chunkStartToken = *opParamInfo_.chunkStartToken;
+    }
+    QLIInfo.useRemap = (QLIInfo.topmCount > 0);
+
     QLIInfo.inputQLayout = qLayout_;
     QLIInfo.inputKLayout = kLayout_;
 }
@@ -907,6 +919,8 @@ ge::graphStatus VllmQuantLightningIndexerTiling::DoTiling(QLITilingInfo *tilingI
     tilingData_.set_batchSupperFlag(tilingInfo->batchSupperFlag);
     tilingData_.set_stride(tilingInfo->stride);
     tilingData_.set_scaleStride(tilingInfo->scaleStride);
+    tilingData_.set_topmCount(tilingInfo->topmCount);
+    tilingData_.set_chunkStartToken(tilingInfo->chunkStartToken);
     tilingData_.SaveToBuffer(context_->GetRawTilingData()->GetData(), context_->GetRawTilingData()->GetCapacity());
     context_->GetRawTilingData()->SetDataSize(tilingData_.GetDataSize());
 

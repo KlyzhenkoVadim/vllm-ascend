@@ -65,6 +65,11 @@ public:
             .DataType({ge::DT_INT32})
             .Format({ge::FORMAT_ND})
             .AutoContiguous();
+        this->Input("topm_idxs")
+            .ParamType(OPTIONAL)
+            .DataType({ge::DT_INT32})
+            .Format({ge::FORMAT_ND})
+            .AutoContiguous();
         this->Output("sparse_indices").ParamType(REQUIRED).DataType({ge::DT_INT32}).Format({ge::FORMAT_ND});
         this->Output("sparse_values").ParamType(REQUIRED).DataType({ge::DT_FLOAT}).Format({ge::FORMAT_ND});
         this->Attr("query_quant_mode").AttrType(REQUIRED).Int(0);  // 0: 默认值，per-token-head
@@ -79,6 +84,8 @@ public:
         this->Attr("return_values").AttrType(OPTIONAL).Bool(false); // 是否返回sparse_values
         this->Attr("stride").AttrType(OPTIONAL).Int(1);             // stride参数
         this->Attr("scale_stride").AttrType(OPTIONAL).Int(1);       // scaleStride参数
+        this->Attr("topm_count").AttrType(OPTIONAL).Int(0);         // topM remap: number of top-M tokens
+        this->Attr("chunk_start_token").AttrType(OPTIONAL).Int(0);  // topM remap: global token idx of chunk start
         OpAICoreConfig aicore_config;
         aicore_config.DynamicCompileStaticFlag(true)
             .DynamicFormatFlag(true)
@@ -131,6 +138,11 @@ public:
             .Format({ge::FORMAT_ND})
             .AutoContiguous();
         aicore_config_950.Input("metadata")
+            .ParamType(OPTIONAL)
+            .DataType({ge::DT_INT32})
+            .Format({ge::FORMAT_ND})
+            .AutoContiguous();
+        aicore_config_950.Input("topm_idxs")
             .ParamType(OPTIONAL)
             .DataType({ge::DT_INT32})
             .Format({ge::FORMAT_ND})

@@ -30,7 +30,7 @@ using namespace optiling::detail;
         GET_TILING_DATA_WITH_STRUCT(QLITilingData, tiling_data_in, tiling);                                  \
         const QLITilingData *__restrict tiling_data = &tiling_data_in;                                       \
         op.Init(query, key, weights, queryScale, keyScale, actualSeqLengthsQ, actualSeqLengthsK, blocktable, \
-                metadata, sparseIndices, user, tiling_data, &tPipe);                                        \
+                metadata, sparseIndices, user, topmIdxs, tiling_data, &tPipe);                                \
         op.Process();                                                                                        \
     } while (0)
 
@@ -40,7 +40,8 @@ __global__ __aicore__ void vllm_quant_lightning_indexer(__gm__ uint8_t *query, _
                                                    __gm__ uint8_t *actualSeqLengthsQ, __gm__ uint8_t *actualSeqLengthsK,
                                                    __gm__ uint8_t *blocktable, __gm__ uint8_t *metadata,
                                                    __gm__ uint8_t *sparseIndices, __gm__ uint8_t *sparseValues,
-                                                   __gm__ uint8_t *workspace, __gm__ uint8_t *tiling)
+                                                   __gm__ uint8_t *workspace, __gm__ uint8_t *topmIdxs,
+                                                   __gm__ uint8_t *tiling)
 {
     TPipe tPipe;
     __gm__ uint8_t *user = GetUserWorkspace(workspace);

@@ -1074,8 +1074,10 @@ std::tuple<at::Tensor, at::Tensor> npu_vllm_quant_lightning_indexer_npu(
     const c10::optional<at::Tensor> &actual_seq_lengths_key,
     const c10::optional<at::Tensor> &block_table,
     const c10::optional<at::Tensor> &metadata,
+    const c10::optional<at::Tensor> &topm_idxs,
     c10::string_view layout_query, c10::string_view layout_key, int64_t sparse_count,
-    int64_t sparse_mode, int64_t pre_tokens, int64_t next_tokens, int64_t cmp_ratio, bool return_value)
+    int64_t sparse_mode, int64_t pre_tokens, int64_t next_tokens, int64_t cmp_ratio, bool return_value,
+    int64_t topm_count, int64_t chunk_start_token)
 {
     std::string query_layout_str = std::string(layout_query);
     std::string key_layout_str = std::string(layout_key);
@@ -1100,8 +1102,8 @@ std::tuple<at::Tensor, at::Tensor> npu_vllm_quant_lightning_indexer_npu(
 
     EXEC_NPU_CMD(aclnnVllmQuantLightningIndexer, query,
         key, weights, query_dequant_scale, key_dequant_scale, actual_seq_lengths_query, actual_seq_lengths_key,
-        block_table, metadata, query_quant_mode, key_quant_mode, query_layout_ptr, key_layout_ptr, sparse_count, sparse_mode,
-        pre_tokens, next_tokens, cmp_ratio, return_value, stride, scale_stride, sparse_indices_out, sparse_values_out);
+        block_table, metadata, topm_idxs, query_quant_mode, key_quant_mode, query_layout_ptr, key_layout_ptr, sparse_count, sparse_mode,
+        pre_tokens, next_tokens, cmp_ratio, return_value, stride, scale_stride, topm_count, chunk_start_token, sparse_indices_out, sparse_values_out);
 
 
     return std::tuple<at::Tensor, at::Tensor>(sparse_indices_out, sparse_values_out);
@@ -2479,11 +2481,13 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
             "Tensor? actual_seq_lengths_key=None, "
             "Tensor? block_table=None, "
             "Tensor? metadata=None, "
+            "Tensor? topm_idxs=None, "
             "str layout_query=\"BSND\", str layout_key=\"BSND\", "
             "int sparse_count=2048, int sparse_mode=3, "
             "int pre_tokens=9223372036854775807, "
             "int next_tokens=9223372036854775807, "
-            "int cmp_ratio=1, bool return_value=False"
+            "int cmp_ratio=1, bool return_value=False, "
+            "int topm_count=0, int chunk_start_token=0"
         ") -> (Tensor sparse_indices, Tensor sparse_values)"
         );
     ops.impl("npu_vllm_quant_lightning_indexer", torch::kPrivateUse1, &vllm_ascend::npu_vllm_quant_lightning_indexer_npu);

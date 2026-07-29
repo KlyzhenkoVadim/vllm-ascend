@@ -59,6 +59,7 @@ struct RunInfo {
     bool isFirstS2InnerLoop;
     bool isLastS2InnerLoop;
     bool isValid = false;
+    bool isRemapBlock = false;   // this S2 block is in top-M remap range
 };
 
 struct ConstInfo {
@@ -110,6 +111,10 @@ struct ConstInfo {
     uint32_t actualLenDims = 0U;   // KV 的actualSeqLength 的维度
     bool isAccumSeqS1 = false;     // 是否累加模式
     bool isAccumSeqS2 = false;     // 是否累加模式
+    bool useRemap = false;          // topM remap mode
+    uint32_t topmCount = 0;         // number of top-M tokens
+    int64_t chunkStartToken = 0;    // global token index of chunk start
+    uint32_t numTopmBlocks = 0;     // number of S2 blocks in top-M range
 
     uint32_t s2Start = 0U;
     uint32_t s2End = 0U;

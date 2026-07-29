@@ -51,7 +51,8 @@ public:
     __aicore__ inline void InitVecWorkspaceTensor(GlobalTensor<half> vec0OutGm, GlobalTensor<MM1_OUT_T> mm1ResGm);
     __aicore__ inline void InitVecInputTensor(GlobalTensor<half> weightsGm, GlobalTensor<half> qScaleGm,
                                               GlobalTensor<half> kScaleGm, GlobalTensor<int32_t> indiceOutGm,
-                                              GlobalTensor<int32_t> blockTableGm);
+                                              GlobalTensor<int32_t> blockTableGm,
+                                              GlobalTensor<int32_t> topmIdxsGm);
     __aicore__ inline void CleanInvalidOutput(int64_t invalidS1offset);
     __aicore__ inline int32_t AlignS2(int32_t cuS2Len);
     __aicore__ inline void AllocEventID();
@@ -65,6 +66,7 @@ protected:
     GlobalTensor<half> vec0OutGm;
     GlobalTensor<int32_t> indiceOutGm;
     GlobalTensor<int32_t> blockTableGm;
+    GlobalTensor<int32_t> topmIdxsGm;
     // =================================常量区=================================
 
 private:
@@ -104,10 +106,32 @@ template <typename QLIT>
 __aicore__ inline void QLIVector<QLIT>::GetKeyScale(const QLICommon::RunInfo &runInfo, const LocalTensor<half> &resUb,
                                                     int64_t batchId, int64_t startS2, int64_t getLen)
 {
-    // startS2一定能整除kCacheBlockSize_
     AscendC::DataCopyPadExtParams<half> padParams{false, 0, 0, 0};
     AscendC::DataCopyExtParams copyInParams;
     if constexpr (PAGE_ATTENTION) {
+        if (runInfo.isRemapBlock) {
+            copyInParams.blockCount = 1;
+            copyInParams.blockLen = sizeof(half);
+            copyInParams.srcStride = 0;
+            copyInParams.dstStride = 0;
+            copyInParams.rsv = 0;
+            for (int32_t i = 0; i < (int32_t)getLen; i++) {
+                uint64_t compositePos = (uint64_t)(startS2 + i);
+                uint64_t globalPos;
+                if (compositePos < constInfo_.topmCount) {
+                    globalPos = topmIdxsGm.GetValue(batchId * constInfo_.topmCount + compositePos);
+                } else {
+                    globalPos = constInfo_.chunkStartToken + (compositePos - constInfo_.topmCount);
+                }
+                uint32_t blkId = globalPos / kCacheBlockSize_;
+                uint32_t blkOff = globalPos % kCacheBlockSize_;
+                uint32_t physBlk = blockTableGm.GetValue(batchId * maxBlockNumPerBatch_ + blkId);
+                SetWaitFlag<HardEvent::S_MTE2>(HardEvent::S_MTE2);
+                AscendC::DataCopyPad(resUb[i], kScaleGm[physBlk * constInfo_.scaleStride + blkOff],
+                                     copyInParams, padParams);
+            }
+            return;
+        }
         int32_t startBlockTableIdx = startS2 / kCacheBlockSize_;
         int32_t startBlockTableOffset = startS2 % kCacheBlockSize_;
         int32_t blockTableBatchOffset = batchId * maxBlockNumPerBatch_;
@@ -192,13 +216,15 @@ template <typename QLIT>
 __aicore__ inline void QLIVector<QLIT>::InitVecInputTensor(GlobalTensor<half> weightsGm, GlobalTensor<half> qScaleGm,
                                                            GlobalTensor<half> kScaleGm,
                                                            GlobalTensor<int32_t> indiceOutGm,
-                                                           GlobalTensor<int32_t> blockTableGm)
+                                                           GlobalTensor<int32_t> blockTableGm,
+                                                           GlobalTensor<int32_t> topmIdxsGm)
 {
     this->weightsGm = weightsGm;
     this->qScaleGm = qScaleGm;
     this->kScaleGm = kScaleGm;
     this->indiceOutGm = indiceOutGm;
     this->blockTableGm = blockTableGm;
+    this->topmIdxsGm = topmIdxsGm;
 }
 
 template <typename QLIT>

@@ -70,6 +70,7 @@ struct RunInfo {
     bool isLastS2InnerLoop;
     bool isAllLoopEnd = false;
     bool isValid = false;
+    bool isRemapBlock = false;   // this S2 block is in top-M remap range
 };
 
 struct ConstInfo {
@@ -125,6 +126,10 @@ struct ConstInfo {
     bool isAccumSeqS1 = false;     // 是否累加模式
     bool isAccumSeqS2 = false;     // 是否累加模式
     bool isLDOpen = false;
+    bool useRemap = false;          // topM remap mode
+    uint32_t topmCount = 0;         // number of top-M tokens
+    int64_t chunkStartToken = 0;    // global token index of chunk start
+    uint32_t numTopmBlocks = 0;     // number of S2 blocks in top-M range
 };
 
 struct SplitCoreInfo {

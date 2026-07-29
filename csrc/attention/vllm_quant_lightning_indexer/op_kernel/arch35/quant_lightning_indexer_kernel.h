@@ -61,7 +61,8 @@ public:
                                 __gm__ uint8_t *queryScale, __gm__ uint8_t *keyScale, __gm__ uint8_t *actualSeqLengthsQ,
                                 __gm__ uint8_t *actualSeqLengthsK, __gm__ uint8_t *blockTable,
                                 __gm__ uint8_t *metadata, __gm__ uint8_t *sparseIndices,
-                                __gm__ uint8_t *workspace, const QLITilingData *__restrict tiling, TPipe *tPipe);
+                                __gm__ uint8_t *workspace, __gm__ uint8_t *topmIdxs,
+                                const QLITilingData *__restrict tiling, TPipe *tPipe);
     __aicore__ inline void Process();
 
     // =================================类型定义区=================================
@@ -166,6 +167,10 @@ __aicore__ inline void QLIPreload<QLIT>::InitTilingData(const QLITilingData *__r
     constInfo.batchSupperFlag = tilingData->batchSupperFlag;
     constInfo.stride = tilingData->stride;
     constInfo.scaleStride = tilingData->scaleStride;
+    constInfo.useRemap = (tilingData->topmCount > 0);
+    constInfo.topmCount = tilingData->topmCount;
+    constInfo.chunkStartToken = tilingData->chunkStartToken;
+    constInfo.numTopmBlocks = cdiv(constInfo.topmCount, constInfo.s2BaseSize);
     constInfo.outputLayout = Q_LAYOUT_T;  // 输出和输入形状一致
     if (Q_LAYOUT_T == LI_LAYOUT::TND) {
         constInfo.isAccumSeqS1 = true;
@@ -376,6 +381,7 @@ __aicore__ inline void QLIPreload<QLIT>::Init(__gm__ uint8_t *query, __gm__ uint
                                               __gm__ uint8_t *actualSeqLengthsQ, __gm__ uint8_t *actualSeqLengthsK,
                                               __gm__ uint8_t *blockTable, __gm__ uint8_t *metadata,
                                               __gm__ uint8_t *sparseIndices, __gm__ uint8_t *workspace,
+                                              __gm__ uint8_t *topmIdxs,
                                               const QLITilingData *__restrict tiling, TPipe *tPipe)
 {
     if ASCEND_IS_AIV {
@@ -411,7 +417,12 @@ __aicore__ inline void QLIPreload<QLIT>::Init(__gm__ uint8_t *query, __gm__ uint
         qScaleGm.SetGlobalBuffer((__gm__ float *)queryScale);
         kScaleGm.SetGlobalBuffer((__gm__ float *)keyScale);
         blockTableGm.SetGlobalBuffer((__gm__ int32_t *)blockTable);
-        vectorService.InitVecInputTensor(weightsGm, qScaleGm, kScaleGm, indiceOutGm, blockTableGm);
+        GlobalTensor<int32_t> topmIdxsGm;
+        if (constInfo.useRemap && topmIdxs != nullptr) {
+            topmIdxsGm.SetGlobalBuffer((__gm__ int32_t *)topmIdxs,
+                                        constInfo.batchSize * constInfo.topmCount);
+        }
+        vectorService.InitVecInputTensor(weightsGm, qScaleGm, kScaleGm, indiceOutGm, blockTableGm, topmIdxsGm);
         vectorService.InitVecWorkspaceTensor(scoreGm);
     } else {
         matmulService.InitParams(constInfo);
@@ -420,7 +431,12 @@ __aicore__ inline void QLIPreload<QLIT>::Init(__gm__ uint8_t *query, __gm__ uint
             blockTableGm.SetGlobalBuffer((__gm__ int32_t *)blockTable);
         }
         keyGm.SetGlobalBuffer((__gm__ K_T *)key);
-        matmulService.InitMm1GlobalTensor(blockTableGm, keyGm, queryGm);
+        GlobalTensor<int32_t> topmIdxsGm;
+        if (constInfo.useRemap && topmIdxs != nullptr) {
+            topmIdxsGm.SetGlobalBuffer((__gm__ int32_t *)topmIdxs,
+                                        constInfo.batchSize * constInfo.topmCount);
+        }
+        matmulService.InitMm1GlobalTensor(blockTableGm, keyGm, queryGm, topmIdxsGm);
     }
     InitBuffers();
 }
@@ -510,6 +526,8 @@ __aicore__ inline void QLIPreload<QLIT>::CalcRunInfo(uint32_t loop, uint32_t s2L
     runInfo.isLastS2InnerLoop = s2LoopIdx == tempLoopInfo.s2LoopEnd;
     runInfo.isAllLoopEnd = (runInfo.bN2Idx == splitCoreInfo.bN2End) && (runInfo.gS1Idx == splitCoreInfo.gS1End) &&
                            (runInfo.s2Idx == splitCoreInfo.s2End);
+
+    runInfo.isRemapBlock = constInfo.useRemap && (s2LoopIdx < constInfo.numTopmBlocks);
 
     if (runInfo.isFirstS2InnerLoop) {
         uint64_t actualSeqQPrefixSum;
