@@ -3014,6 +3014,27 @@ class AscendDSAImpl(DSAAttentionImpl):
 
         return q
 
+    def _gather_indexer_cache(
+        self,
+        flat_idx: torch.Tensor,  # (B, total_count) — flat physical indices, may need padding
+        total_count: int,         # actual number of tokens per batch
+        k2d: torch.Tensor,        # (num_slots * blk, head_dim) — flattened k_cache view
+        s2d: torch.Tensor,        # (num_slots * blk, 1) — flattened scale_cache view
+        blk: int,                 # block_size
+    ):
+        B = flat_idx.shape[0]
+        nblocks = cdiv(total_count, blk)
+        total = nblocks * blk
+        pad = total - total_count
+        if pad:
+            flat_idx = F.pad(flat_idx, (0, pad)).contiguous()
+        fs = flat_idx.stride()
+        flat_idx = torch.as_strided(flat_idx, (B * nblocks, blk),
+                                     (fs[1] * blk, fs[1])).to(torch.int32)
+        new_k = torch_npu.npu_gather_sparse_index(k2d, flat_idx).unsqueeze(2)
+        new_scale = torch_npu.npu_gather_sparse_index(s2d, flat_idx).unsqueeze(2)
+        return new_k, new_scale, nblocks
+
     def _prepare_k_cache_for_qli(
         self,
         indexer_k_cache, # (num_slots, block_size(32), 1, head_dim(128))
@@ -3023,28 +3044,20 @@ class AscendDSAImpl(DSAAttentionImpl):
     ):
         B = topm_idxs.shape[0]
         blk = indexer_k_cache.shape[1]
-        nblocks = cdiv(self.index_topm, blk)
-        total = nblocks * blk
-        pad = total - self.index_topm
 
         flat_idx = torch.gather(block_table, 1, topm_idxs // blk) * blk + topm_idxs % blk
-        if pad:
-            flat_idx = F.pad(flat_idx, (0, pad)).contiguous()
-        fs = flat_idx.stride()
-        flat_idx = torch.as_strided(flat_idx, (B * nblocks, blk), (fs[1] * blk, fs[1])).to(torch.int32)
 
         ks = indexer_k_cache.stride()
         k2d = torch.as_strided(indexer_k_cache,
                             (indexer_k_cache.shape[0] * blk, self.indexer_dim),
                             (ks[1], ks[-1]))
-
         ss = indexer_scale_cache.stride()
         s2d = torch.as_strided(indexer_scale_cache,
                             (indexer_scale_cache.shape[0] * blk, 1),
                             (ss[1], ss[-1]))
 
-        new_k = torch_npu.npu_gather_sparse_index(k2d, flat_idx).unsqueeze(2)
-        new_scale = torch_npu.npu_gather_sparse_index(s2d, flat_idx).unsqueeze(2)
+        new_k, new_scale, nblocks = self._gather_indexer_cache(
+            flat_idx, self.index_topm, k2d, s2d, blk)
 
         tbt = torch.arange(B * nblocks, device=block_table.device).view(B, nblocks).to(torch.int32)
         return (new_k, new_scale, tbt)
@@ -3060,32 +3073,31 @@ class AscendDSAImpl(DSAAttentionImpl):
     ):
         """Build composite [topM | chunk] k/scale caches with sequential block_table."""
         block_size = 32
-        topm_k, topm_scale, _ = self._prepare_k_cache_for_qli(
-            indexer_k_cache, indexer_scale_cache,
-            block_table[:1],
-            topm_idxs.squeeze(1),
-        )
-        num_topm_blocks = topm_k.shape[0]
-        num_chunk_blocks = cdiv(act_qlen, block_size)
-        chunk_phys = block_table[0, chunk_start_logical : chunk_start_logical + num_chunk_blocks].long()
-        chunk_k = indexer_k_cache[chunk_phys]
-        chunk_scale = indexer_scale_cache[chunk_phys]
-
-        num_composite = num_topm_blocks + num_chunk_blocks
-        head_dim = indexer_k_cache.shape[-1]
-        composite_k = torch.zeros(num_composite, block_size, 1, head_dim,
-                                  dtype=indexer_k_cache.dtype, device=indexer_k_cache.device)
-        composite_scale = torch.zeros(num_composite, block_size, 1, 1,
-                                      dtype=indexer_scale_cache.dtype, device=indexer_scale_cache.device)
-
-        composite_k[:num_topm_blocks] = topm_k
-        composite_k[num_topm_blocks:] = chunk_k
-        composite_scale[:num_topm_blocks] = topm_scale
-        composite_scale[num_topm_blocks:] = chunk_scale
-
+        blk = block_size
         B = block_table.shape[0]
-        composite_bt = torch.arange(num_composite, device=block_table.device,
-                                    dtype=block_table.dtype).expand(B, -1)
+        device = block_table.device
+        topm_squeezed = topm_idxs.squeeze(1)  # (1, index_topm)
+
+        ks = indexer_k_cache.stride()
+        k2d = torch.as_strided(indexer_k_cache,
+                            (indexer_k_cache.shape[0] * blk, self.indexer_dim),
+                            (ks[1], ks[-1]))
+        ss = indexer_scale_cache.stride()
+        s2d = torch.as_strided(indexer_scale_cache,
+                            (indexer_scale_cache.shape[0] * blk, 1),
+                            (ss[1], ss[-1]))
+
+        topm_flat = torch.gather(block_table[:1], 1, topm_squeezed // blk) * blk + topm_squeezed % blk  # (1, index_topm)
+        chunk_global = chunk_start_logical * block_size + torch.arange(act_qlen, dtype=torch.int32, device=device)
+        chunk_flat = torch.gather(block_table[:1], 1, chunk_global // blk) * blk + chunk_global % blk  # (1, act_qlen)
+        combined_flat = torch.cat([topm_flat, chunk_flat], dim=1)  # (1, index_topm + act_qlen)
+
+        num_topm_blocks = cdiv(self.index_topm, blk)
+        total_count = self.index_topm + act_qlen
+        composite_k, composite_scale, nblocks = self._gather_indexer_cache(
+            combined_flat, total_count, k2d, s2d, blk)
+
+        composite_bt = torch.arange(nblocks, device=device, dtype=block_table.dtype).expand(B, -1)
         composite_kvlen = torch.tensor([num_topm_blocks * block_size + act_qlen],
-                                        device=block_table.device, dtype=torch.int32)
+                                        device=device, dtype=torch.int32)
         return composite_k, composite_scale, composite_bt, composite_kvlen, num_topm_blocks
