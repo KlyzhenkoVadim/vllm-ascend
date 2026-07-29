@@ -170,7 +170,7 @@ __aicore__ inline void QLIPreload<QLIT>::InitTilingData(const QLITilingData *__r
     constInfo.useRemap = (tilingData->topmCount > 0);
     constInfo.topmCount = tilingData->topmCount;
     constInfo.chunkStartToken = tilingData->chunkStartToken;
-    constInfo.numTopmBlocks = cdiv(constInfo.topmCount, constInfo.s2BaseSize);
+    constInfo.numTopmBlocks = (constInfo.topmCount + constInfo.s2BaseSize - 1) / constInfo.s2BaseSize;
 
     constInfo.outputLayout = Q_LAYOUT_T;  // 输出和输入形状一致
     if (Q_LAYOUT_T == LI_LAYOUT::TND) {

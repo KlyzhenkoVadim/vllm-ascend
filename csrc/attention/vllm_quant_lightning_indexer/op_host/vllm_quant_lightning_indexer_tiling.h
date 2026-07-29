@@ -141,7 +141,6 @@ struct QLIParaInfo {
     const bool *returnValues = nullptr;
     const int64_t *stride = nullptr;
     const int64_t *scaleStride = nullptr;
-    TilingOptionalParaInfo topmIdxs = {nullptr, nullptr};
     const int64_t *topmCount = nullptr;
     const int64_t *chunkStartToken = nullptr;
 };
