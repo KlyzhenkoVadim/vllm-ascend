@@ -2313,26 +2313,9 @@ class NPUModelRunner(GPUModelRunner):
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
-            # Sync topM state back from decode temp buffers to input_batch.topm_state
-            #TODO(KlyzhenkoVadim): Why do we need this here?!
+            # Sync topM state for prefill
             if not use_spec_decode and attn_metadata is not None:
-                # for ub_meta in attn_metadata:
-                #TODO(KlyzhenkoVadim): Have a check 
                 for layer_name, meta in attn_metadata.items():
-                    decode = getattr(meta, 'decode', None)
-                    if decode is not None and decode.topm_idxs is not None:
-                        B = decode.topm_idxs.shape[0]
-                        for i, rid in enumerate(self.input_batch.req_ids[:B]):
-                            if rid is None:
-                                continue
-                            layer_state = self.input_batch.topm_state.setdefault(
-                                rid, {}
-                            ).setdefault(layer_name, TopMReqState())
-                            #TODO(KlyzhenkoVadim): We don't need to set topm_idxs
-                            #if decode.topm_idxs[i] is zeros_like!!!
-                            #TODO(KlyzhenkoVadim): Try to use 
-                            layer_state.topm_idxs = decode.topm_idxs[i].clone()
-
                     prefill = getattr(meta, 'prefill', None)
                     if prefill is not None and prefill.topm_idxs is not None:
                         last_token_topm = prefill.topm_idxs[-1].clone()
