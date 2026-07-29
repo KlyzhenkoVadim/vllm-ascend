@@ -343,8 +343,7 @@ __aicore__ inline void QLIMatmul<QLIT>::KeyNd2NzForPA(uint64_t s2L1RealSize, uin
             s2L1Offset += 1;
         } else {
             if (constInfo_.useRemap) {
-                uint64_t chunkOffset = constInfo_.chunkStartToken - constInfo_.numTopmBlocks * constInfo_.kCacheBlockSize;
-                virtualPos += chunkOffset;
+                virtualPos += constInfo_.chunkStartToken - constInfo_.numTopmBlocks * constInfo_.s2BaseSize;
             }
             s2BlkId = virtualPos / constInfo_.kCacheBlockSize;
             s2BlkOffset = virtualPos % constInfo_.kCacheBlockSize;

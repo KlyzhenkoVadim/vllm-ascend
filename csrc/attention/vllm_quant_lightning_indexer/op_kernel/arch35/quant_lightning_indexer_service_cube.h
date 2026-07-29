@@ -274,15 +274,9 @@ __aicore__ inline void QLIMatmul<QLIT>::KeyNd2NzForPA(uint64_t s2L1RealSize, uin
                      keyGm_[keyGmOffset], nd2nzPara);
             s2L1Offset += 1;
         } else {
-            /// Original path: contiguous block-table resolution
-            /// For chunk portion with remap: offset the virtual position by chunkStartToken
+            /// Chunk portion: offset composite position to global position
             if (constInfo_.useRemap) {
-                /// Chunk portion: virtualPos >= topmCount, so globalPos = chunkStartToken + (virtualPos - topmCount)
-                /// But since we already use s2Idx-split for isRemapBlock, chunk blocks use chunk_start_logical offset
-                /// In the composite space, chunk starts at virtualPos = topmAligned (after numTopmBlocks * blockSize)
-                /// So we just need to offset by chunk_start_token - topm_aligned
-                uint64_t chunkOffset = constInfo_.chunkStartToken - constInfo_.numTopmBlocks * constInfo_.kCacheBlockSize;
-                virtualPos += chunkOffset;
+                virtualPos += constInfo_.chunkStartToken - constInfo_.numTopmBlocks * constInfo_.s2BaseSize;
             }
             /// Standard contiguous block-table path
             s2BlkId = virtualPos / constInfo_.kCacheBlockSize;

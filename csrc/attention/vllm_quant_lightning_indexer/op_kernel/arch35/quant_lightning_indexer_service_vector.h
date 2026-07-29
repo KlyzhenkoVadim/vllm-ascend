@@ -292,6 +292,9 @@ __aicore__ inline void QLIVector<QLIT>::GetKeyScale(const QLICommon::RunInfo &ru
             }
             return;
         }
+        if (constInfo_.useRemap) {
+            startS2 += constInfo_.chunkStartToken - constInfo_.numTopmBlocks * s2BaseSize_;
+        }
         int32_t startBlockTableIdx = startS2 / kCacheBlockSize_;
         int32_t startBlockTableOffset = startS2 % kCacheBlockSize_;
         int32_t blockTableBatchOffset = batchId * maxBlockNumPerBatch_;
