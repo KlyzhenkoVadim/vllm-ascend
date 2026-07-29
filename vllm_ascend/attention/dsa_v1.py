@@ -3031,37 +3031,6 @@ class AscendDSAImpl(DSAAttentionImpl):
                     num_topm_blocks,
                 )
                 prefill_meta.topm_idxs = topk_idxs
-
-                topk_idxs, _ = torch.ops._C_ascend.npu_vllm_quant_lightning_indexer(
-                    query=q,
-                    key=composite_k,
-                    weights=DeviceOperator.prepare_dsa_indexer_weights(weights),
-                    query_dequant_scale=DeviceOperator.prepare_dsa_indexer_query_scale(q_scale),
-                    key_dequant_scale=DeviceOperator.prepare_dsa_indexer_key_scale(composite_scale),
-                    actual_seq_lengths_query=qlens,
-                    actual_seq_lengths_key=composite_kvlen,
-                    block_table=composite_bt,
-                    metadata=qli_metadata,
-                    query_quant_mode=0,
-                    key_quant_mode=0,
-                    layout_query="TND",
-                    layout_key="PA_BSND",
-                    sparse_count=self.index_topm,
-                    sparse_mode=3,
-                    pre_tokens=(1 << 63) - 1,
-                    next_tokens=(1 << 63) - 1,
-                    cmp_ratio=4,
-                    return_value=False,
-                )
-
-                topk_idxs = self._remap_composite_to_original(
-                    topk_idxs,
-                    prefill_meta.topm_idxs,
-                    prefill_meta.topm_chunk_start_logical,
-                    prefill_meta.act_qlen,
-                    num_topm_blocks,
-                )
-                prefill_meta.topm_idxs = topk_idxs
                 topk_idxs = topk_idxs[:, :, :self.index_topk]
             else:
                 kvlens = prefill_meta.seq_lens
