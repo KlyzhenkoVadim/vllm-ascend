@@ -115,7 +115,7 @@ class AscendDeepseekSparseAttention(MultiHeadLatentAttentionWrapper):
         self.prefix = prefix
 
         ascend_config = get_ascend_config()
-
+        
         self.enable_local_k_cache = ascend_config.enable_local_k_cache
 
         self.dsa_attn = DSAAttention(
@@ -264,7 +264,7 @@ def _build_kv_cache(self, forward_context):
                 self.indexer.local_k_cache.kv_cache[0][0],
                 self.indexer.local_k_cache.kv_cache[0][1],
             )
-
+    
     if self.enable_local_k_cache:
         return tuple(
             [

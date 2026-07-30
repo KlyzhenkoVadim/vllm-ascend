@@ -604,7 +604,7 @@ class Indexer(nn.Module):
                 cache_config=cache_config,
                 compress_ratio=self.compress_ratio,
             )
-
+            
             if self.enable_local_k_cache:
                 self.local_k_cache = AscendDeepseekV4IndexerLocalCache(
                     head_dim=self.head_dim,
@@ -1374,7 +1374,7 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
             # TODO:
             if not name.startswith("model"):
                 name = f"model.{name}"
-
+            
             m=re.match(r'model\.layers\.(\d+)\.', name)
             if m and int(m.group(1)) >= self.config.num_hidden_layers:
                 continue

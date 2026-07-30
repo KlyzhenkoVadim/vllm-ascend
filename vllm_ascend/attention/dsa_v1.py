@@ -1844,7 +1844,7 @@ class AscendDSAImpl(DSAAttentionImpl):
                 indexer_local_kv_scale_metadata,
                 swa_metadata) = (
                     attn_metadata
-                )
+                )                
                 # sorted keys: [attn, compressor.state_cache, indexer.compressor.state_cache, indexer.k_cache, swa_cache]
                 compress_common_attn_metadata = compressor_attn_metadata
             elif self.compress_ratio == 128:
@@ -2185,8 +2185,8 @@ class AscendDSAImpl(DSAAttentionImpl):
         # idx // 128 得到 block_table 的逻辑 block id（序号），查询 block_table 后得到全局 cache 中的物理 block id。
         # topm_block_idxs/topm_block_offsets: [num_decode_rows, topM]。
         topm_block_idxs = torch.gather(
-            global_block_table.to(torch.long)[:num_decode_rows],
-            1,
+            global_block_table.to(torch.long)[:num_decode_rows], 
+            1, 
             torch.div(safe_topm_idxs, block_size, rounding_mode="floor")
         )
         topm_block_offsets = safe_topm_idxs % block_size
@@ -2347,7 +2347,7 @@ class AscendDSAImpl(DSAAttentionImpl):
     # build_decode_metadata中没有req信息，最好在model_runner的metadata中计算，只需要增加少量metadata字段就行
     # 待确认：在什么位置计算
     #LINK - /vllm-workspace/vllm-ascend/vllm_ascend/worker/model_runner_v1.py:1810
-
+    
     # 3. topm_indexer_k_cache
     # topm_indexer_k_cache
     # topm_indexer_scale_decode_metadata: 重点是block_table（读），slot_mapping（写）好像不用操心，有专门的算子基于topk_idxs gather和写入，其他可以仿indexer_scale_decode_metadata
@@ -2369,7 +2369,7 @@ class AscendDSAImpl(DSAAttentionImpl):
         # _
         # indexer_k_cache: [78763, 128, 1, 128]
         # indexer_scale_cache: [78763, 128, 1, 1] 量化scale
-        # indexer_local_k_cache: [78763, 128, 1, 128] indexcache topm cache
+        # indexer_local_k_cache: [78763, 128, 1, 128] indexcache topm cache 
         # indexer_local_scale_cache: [78763, 128, 1, 1] indexcache topm scale cache
         (compress_kv_cache,
          swa_kv_cache,
@@ -2811,7 +2811,7 @@ class AscendDSAImpl(DSAAttentionImpl):
                 _,
             ) = attn_metadata
 
-
+           
         if (
             _is_w8a8_dynamic(self.inderxer_wq_b)
             and qr_pertoken_scale is not None

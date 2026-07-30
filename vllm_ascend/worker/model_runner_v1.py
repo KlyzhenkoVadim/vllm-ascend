@@ -2011,7 +2011,7 @@ class NPUModelRunner(GPUModelRunner):
         if ((
             self.use_async_scheduling and self.num_spec_tokens and self._draft_token_ids is None  # type: ignore[has-type]
         ) or (
-            # This branch specifically triggers a deepcopy during the prefill phase
+            # This branch specifically triggers a deepcopy during the prefill phase 
             # only for PCP (Parallel Context Processing) + Multi-Modal (MM) scenarios. 
             # It does not affect other use cases. This is a temporary workaround and 
             # will be removed once upstream vLLM provides native support for PCP + MM.
@@ -2115,7 +2115,7 @@ class NPUModelRunner(GPUModelRunner):
                         is_normal_decode = (computed_tokens[req_index] and num_scheduled_tokens_np[req_index] == 1)
                         if not is_normal_decode:
                             continue
-
+                        
                         last_anchor_pos = self.indexcache_last_anchor_pos.setdefault(req_id, -1)
                         cur_pos = computed_tokens[req_index]
                         is_anchor = (last_anchor_pos < 0 or cur_pos - last_anchor_pos >= self.indexcache_anchor_interval)

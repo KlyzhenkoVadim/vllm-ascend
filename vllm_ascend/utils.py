@@ -1693,11 +1693,11 @@ def get_compressed_pos_and_indices(
 
     from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
 
-
+    
     for kv_cache_group_id, kv_cache_group_spec in enumerate(kv_cache_groups):
         # Calculate compressed length of historical & total tokens
         #NOTE - 1. 计算压缩tokens的数量
-        # 1. 遍历和寻找kv cache spec，拿到compress_ratio
+        # 1. 遍历和寻找kv cache spec，拿到compress_ratio 
         # 2. 计算压缩后的历史tokens数和本轮执行后的总tokens数，相减得到本轮产生的压缩tokens数
         if isinstance(kv_cache_group_spec.kv_cache_spec, UniformTypeKVCacheSpecs):
             kv_cache_spec = next(iter(kv_cache_group_spec.kv_cache_spec.kv_cache_specs.values()))

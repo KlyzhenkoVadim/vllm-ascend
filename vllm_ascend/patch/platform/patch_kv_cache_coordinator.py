@@ -368,7 +368,7 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                     continue
                 '''To be considered'''
                 '''Fixed Cache Prefix Mechanism'''
-
+                
                 use_eagle = idx in self.eagle_attn_group_indices and idx not in eagle_verified
 
                 _max_length = curr_hit_length
