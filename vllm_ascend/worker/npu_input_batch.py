@@ -16,6 +16,8 @@
 # This file is a part of the vllm-ascend project.
 # Adapted from vllm-project/vllm/vllm/worker/gpu_input_batch.py
 #
+from dataclasses import dataclass
+from typing import Optional
 
 import numpy as np
 import torch
@@ -25,9 +27,16 @@ from vllm.v1.kv_cache_interface import KVCacheGroupSpec
 from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.pool.metadata import PoolingStates
 from vllm.v1.sample.logits_processor import BatchUpdateBuilder, LogitsProcessors
-from vllm.v1.worker.gpu_input_batch import InputBatch
+from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
 from vllm_ascend.worker.block_table import MultiGroupBlockTable
+
+
+@dataclass
+class TopMReqState:
+    ustep: int = 0
+    start_cache: bool = False
+    topm_idxs: Optional[torch.Tensor] = None
 
 
 class NPUInputBatch(InputBatch):
@@ -229,6 +238,8 @@ class NPUInputBatch(InputBatch):
         self.pooling_params: dict[str, PoolingParams] = {}
         self.pooling_states: dict[str, PoolingStates] = {}
 
+        self.topm_state: dict[str, dict[str, TopMReqState]] = {}
+
         # Cached reference to the GPU tensor of previously sampled tokens
         self.prev_sampled_token_ids: torch.Tensor | None = None
         self.prev_req_id_to_index: dict[str, int] | None = None
@@ -237,3 +248,13 @@ class NPUInputBatch(InputBatch):
         # (e.g. penalties).
         self.sampled_token_ids_cpu: torch.Tensor | None = None
         self.async_copy_ready_event: torch.Event | None = None
+
+    def add_request(self, request: CachedRequestState) -> int:
+        req_index = super().add_request(request)
+        self.topm_state.setdefault(request.req_id, {})
+        return req_index
+
+    def remove_request(self, req_id: str) -> int | None:
+        req_index = super().remove_request(req_id)
+        self.topm_state.pop(req_id, None)
+        return req_index
