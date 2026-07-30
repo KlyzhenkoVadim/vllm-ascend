@@ -14,7 +14,6 @@ from vllm.v1.attention.backend import AttentionBackend, AttentionCGSupport, Atte
 from vllm.v1.kv_cache_interface import AttentionSpec
 
 from vllm_ascend.ascend_config import get_ascend_config
-from vllm_ascend.indexcache import IndexCacheDecodeMode
 from vllm_ascend.attention.abstract import DSAAttentionImpl
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
@@ -272,11 +271,6 @@ class AscendDSADecodeMetadata:
     start_pos: torch.Tensor = None
     sas_metadata: torch.Tensor = None
     qli_metadata: torch.Tensor = None
-    #ANCHOR - Metadata构造indexcache相关字段
-    indexcache_batch_mode: IndexCacheDecodeMode | None = None
-    indexcache_req_ids: tuple[str, ...] | None = None
-    qli_seq_lens: torch.Tensor | None = None
-    qli_sparse_count: int | None = None
 
 
 @dataclass
@@ -537,9 +531,6 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         num_reqs_actual = kwargs.get("num_reqs_actual")
         self.prefill_ratio_to_sas_metadata = kwargs.get("prefill_ratio_to_sas_metadata")
         self.decode_ratio_to_sas_metadata = kwargs.get("decode_ratio_to_sas_metadata")
-        #ANCHOR - 获取model_runner传入的indexcache相关变量
-        indexcache_batch_decode_mode = kwargs.get("indexcache_batch_decode_mode")
-        indexcache_batch_req_ids = kwargs.get("indexcache_batch_req_ids")
         assert self.prefill_ratio_to_sas_metadata is not None
         assert self.decode_ratio_to_sas_metadata is not None
         self.block_size = kwargs.get("block_size", 128)
@@ -603,8 +594,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         decode_metadata = None
 
         if self.num_decodes > 0:
-            #ANCHOR - 将indexcache相关变量传入build_decode_metadata
-            decode_metadata = self.build_decode_metadata(common_prefix_len, common_attn_metadata, num_reqs_actual, indexcache_batch_decode_mode, indexcache_batch_req_ids)
+            decode_metadata = self.build_decode_metadata(common_prefix_len, common_attn_metadata, num_reqs_actual)
 
         return self.metadata_cls(  # type: ignore
             num_input_tokens=common_attn_metadata.num_input_tokens,
@@ -892,9 +882,6 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         common_prefix_len: int,
         common_attn_metadata: AscendCommonAttentionMetadata,
         num_reqs_actual: int | None,
-        #ANCHOR - 函数签名增加indexcache相关变量
-        indexcache_batch_mode: IndexCacheDecodeMode | None = None,
-        indexcache_batch_req_ids: tuple[str, ...] | None = None,
     ) -> AscendDSADecodeMetadata:
         assert self.decode_ratio_to_sas_metadata is not None
         if self.decode_ratio_to_sas_metadata.get("query_start_loc", None) is None:
@@ -1117,16 +1104,6 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 )
             self.decode_sas_metadata[:1024] = self.decode_ratio_to_sas_metadata[layer_name]
         assert self.decode_qli_metadata is not None
-        #ANCHOR - qli_metadata
-        indexcache_topm = get_ascend_config().indexcache_topm
-        qli_seq_lens = self.seq_lens[: self.num_decodes].clone()
-        qli_max_seqlen_k = max_seqlen_kv
-        qli_sparse_count = index_topk
-        if indexcache_batch_mode is IndexCacheDecodeMode.ANCHOR:
-            qli_sparse_count = indexcache_topm
-        if indexcache_batch_mode is IndexCacheDecodeMode.REUSE:
-            qli_seq_lens = torch.clamp(qli_seq_lens, max=indexcache_topm * 4)
-            qli_max_seqlen_k = min(max_seqlen_kv, indexcache_topm * 4)
         if self.decode_ratio_to_sas_metadata.get("qli") is None:
             #LINK - /vllm-workspace/vllm-ascend/csrc/attention/quant_lightning_indexer_metadata/README.md
             # 每轮decode都会进入if分支重建self.decode_ratio_to_sas_metadata["qli"]，同一轮内会层间复用
@@ -1135,7 +1112,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             # TND、BSND是指tensor物理排布：batch_size (B) / seq_len (S) / total_tokens (T) / head (N) / head_dim (D)。TND即vllm拼接的一维flat batch布局，BSND即 Transformer通用基于batch的输入布局。PA代表paged attention，按block页表存储kv cache，PA_BSND逻辑上BSND操作但物理上按block来寻址。
             self.decode_ratio_to_sas_metadata["qli"] = torch.ops._C_ascend.npu_vllm_quant_lightning_indexer_metadata(
                 actual_seq_lengths_query=query_start_loc[1:].clone(),
-                actual_seq_lengths_key=qli_seq_lens,
+                actual_seq_lengths_key=self.seq_lens[: self.num_decodes].clone(),
                 num_heads_q=self.model_config.hf_config.index_n_heads,  # 64
                 num_heads_k=1,
                 head_dim=self.model_config.hf_config.index_head_dim,  # 128
@@ -1143,11 +1120,10 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 key_quant_mode=0,
                 batch_size=len(self.seq_lens[: self.num_decodes]),
                 max_seqlen_q=max_seqlen_q,
-                max_seqlen_k=qli_max_seqlen_k,
+                max_seqlen_k=max_seqlen_kv,
                 layout_query="TND",
                 layout_key="PA_BSND",
-                sparse_count=qli_sparse_count,
-                # sparse_count=self.model_config.hf_config.index_topk,  # 512
+                sparse_count=index_topk,
                 sparse_mode=3,
                 pre_tokens=(1 << 63) - 1,
                 next_tokens=(1 << 63) - 1,
@@ -1176,10 +1152,6 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             start_pos=self.start_pos_decode[: self.num_decodes],  # cached
             sas_metadata=self.decode_sas_metadata,
             qli_metadata=self.decode_qli_metadata,
-            indexcache_batch_mode=indexcache_batch_mode,
-            indexcache_req_ids=tuple(indexcache_batch_req_ids[: self.num_decodes]) if indexcache_batch_req_ids is not None else None,
-            qli_seq_lens=qli_seq_lens,
-            qli_sparse_count=qli_sparse_count,
         )
         return decode_metadata
     #!SECTION
@@ -2421,9 +2393,6 @@ class AscendDSAImpl(DSAAttentionImpl):
                 compress_common_attn_metadata = swa_metadata
         common_decode_metadata = _require_decode_metadata(compress_common_attn_metadata)
         swa_decode_metadata = _require_decode_metadata(swa_metadata)
-        #ANCHOR - 从metadata中读取indexcache相关变量
-        indexcache_batch_mode = common_decode_metadata.indexcache_batch_mode
-        indexcache_req_ids = common_decode_metadata.indexcache_req_ids
         cos = common_decode_metadata.cos[layer_name]
         sin = common_decode_metadata.sin[layer_name]
         actual_seq_lengths_query = common_decode_metadata.query_start_loc
@@ -2618,84 +2587,6 @@ class AscendDSAImpl(DSAAttentionImpl):
             torch.ops._C_ascend.npu_scatter_nd_update_v2(
                 compress_kv_cache, compressor_decode_metadata.slot_mapping, compressed_kv
             )
-            #!SECTION
-
-            #SECTION - multistream qli
-            if self.multistream_dsv4_dsa_overlap and self.compress_ratio == 4 and not self.skip_topk:
-                # Wait aux_stream weights_proj done
-                main_stream.wait_stream(aux_stream)
-                weights = weights_proj_output * (self.indexer_softmax_scale * self.indexer_heads**-0.5)
-                #ANCHOR - lightning_indexer
-                # indexer_kv_scale_metadata
-                # 来自函数入参attn_metadata[3]，_require_decode_metadata返回decode字段
-                if indexcache_batch_mode is IndexCacheDecodeMode.REUSE:
-                    indexer_scale_decode_metadata = _require_decode_metadata(indexer_local_kv_scale_metadata)
-                else:
-                    indexer_scale_decode_metadata = _require_decode_metadata(indexer_kv_scale_metadata)
-                # qlens=[1,2] 用于对q_quant区分request边界
-                # kvlens=[7,1217] 用于对整个seq区分request边界
-                qlens = indexer_scale_decode_metadata.query_start_loc[1:]
-                kvlens = (
-                    indexer_scale_decode_metadata.qli_seq_lens
-                    if indexcache_batch_mode is IndexCacheDecodeMode.REUSE
-                    else indexer_scale_decode_metadata.seq_lens
-                )
-                # block_table
-                # [[1, 0, ..., 0], [...]] shape=(row, 8192)，row表示请求数，0表示未用的块
-                block_table = indexer_scale_decode_metadata.block_table
-                # qli_metadata
-                # npu_quant_lightning_indexer_metadata构造的(1024)形状的tensor
-                qli_metadata = indexer_scale_decode_metadata.qli_metadata
-                qli_sparse_count = indexer_scale_decode_metadata.qli_sparse_count
-                compress_topk_idxs, _ = torch.ops._C_ascend.npu_vllm_quant_lightning_indexer(
-                    query=q_quant,
-                    key=indexer_local_k_cache if indexcache_batch_mode is IndexCacheDecodeMode.REUSE else indexer_k_cache,
-                    weights=weights.to(torch.float16),
-                    query_dequant_scale=q_scale,
-                    key_dequant_scale=(
-                        indexer_local_scale_cache if indexcache_batch_mode is IndexCacheDecodeMode.REUSE else indexer_scale_cache
-                    ).squeeze(-2),
-                    actual_seq_lengths_query=qlens,
-                    actual_seq_lengths_key=kvlens,
-                    block_table=block_table,
-                    metadata=qli_metadata,
-                    query_quant_mode=0,
-                    key_quant_mode=0,
-                    layout_query="TND",
-                    layout_key="PA_BSND",
-                    sparse_count=qli_sparse_count,
-                    sparse_mode=3,
-                    pre_tokens=(1 << 63) - 1,
-                    next_tokens=(1 << 63) - 1,
-                    cmp_ratio=4,
-                    return_value=False,
-                )
-                #LINK - /vllm-workspace/vllm-ascend/csrc/attention/quant_lightning_indexer/README.md
-
-                if indexcache_batch_mode is IndexCacheDecodeMode.REUSE:
-                    compress_topk_idxs = self._restore_indexcache_reuse_topk_idxs(
-                        layer_name=layer_name,
-                        req_ids=indexcache_req_ids,
-                        local_topk_idxs=compress_topk_idxs,
-                    )
-                elif indexcache_batch_mode is IndexCacheDecodeMode.ANCHOR:
-                    compress_topm_idxs = compress_topk_idxs
-                    self._save_indexcache_anchor_topm_idxs(
-                        layer_name=layer_name,
-                        req_ids=indexcache_req_ids,
-                        topm_idxs=compress_topm_idxs,
-                    )
-                    indexer_local_decode_metadata = _require_decode_metadata(indexer_local_kv_scale_metadata)
-                    self._save_indexcache_anchor_topm_local_kv(
-                        topm_idxs=compress_topm_idxs,
-                        indexer_k_cache=indexer_k_cache,
-                        indexer_scale_cache=indexer_scale_cache,
-                        indexer_local_k_cache=indexer_local_k_cache,
-                        indexer_local_scale_cache=indexer_local_scale_cache,
-                        global_block_table=block_table,
-                        local_block_table=indexer_local_decode_metadata.block_table,
-                    )
-                    compress_topk_idxs = compress_topm_idxs[..., :self.index_topk]
             #!SECTION
 
             if self.compress_ratio == 4 and self.use_index_cache:
