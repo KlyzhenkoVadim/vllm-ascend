@@ -371,6 +371,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         supports_dcp_with_varlen: bool = False,
     ):
         self.kv_cache_spec = kv_cache_spec
+        self.layer_names = layer_names
         self.metadata_cls = metadata_cls if metadata_cls is not None else AscendDSAMetadata
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config

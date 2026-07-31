@@ -874,7 +874,14 @@ class DeepseekV4Attention(nn.Module):
         # Only meaningful when this layer actually owns an Indexer (c4) and
         # IndexCache is enabled via hf-overrides. MTP layers are excluded
         # because spec_decode shares topk_indices_buffer at the model level
-        # only, leaving impl-level references stale.
+         # only, leaving impl-level references stale.
+        index_topm = None
+        micro_step_num = None
+        local_k_cache_config = vllm_config.additional_config.get("local_k_cache_config", None)
+        if self.compress_ratio == 4 and local_k_cache_config is not None and ".mtp." not in prefix:
+            index_topm = local_k_cache_config.get("index_topm", None)
+            micro_step_num = local_k_cache_config.get("micro_step_num", None)
+
         skip_topk = False
         if self.compress_ratio == 4 and getattr(config, "use_index_cache", False) and ".mtp." not in prefix:
             compress_ratios = getattr(config, "compress_ratios", None) or []
@@ -913,6 +920,8 @@ class DeepseekV4Attention(nn.Module):
             swa_cache_layer=swa_cache_layer,
             topk_indices_buffer=topk_indices_buffer,
             skip_topk=skip_topk,
+            index_topm=index_topm,
+            micro_step_num=micro_step_num,
         )
 
         self.dsa_attn = AscendDeepseekSparseAttention(
