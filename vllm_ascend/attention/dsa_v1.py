@@ -594,7 +594,9 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
 
         prefill_metadata = None
         if self.num_prefills > 0:
-            prefill_metadata = self.build_prefill_metadata(common_prefix_len, common_attn_metadata)
+            prefill_metadata = self.build_prefill_metadata(
+                common_prefix_len, common_attn_metadata,
+                input_batch=kwargs.get("input_batch", None))
 
         decode_metadata = None
 
@@ -627,10 +629,12 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         self,
         common_prefix_len: int,
         common_attn_metadata: AscendCommonAttentionMetadata,
+        input_batch: Optional["NPUInputBatch"] = None,
     ) -> AscendDSAPrefillMetadata:
         assert self.prefill_ratio_to_sas_metadata is not None
         assert self.decode_ratio_to_sas_metadata is not None
         query_start_loc = common_attn_metadata.query_start_loc
+        query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
 
         # reqs_start: the start request position of prefill request
         reqs_start = self.num_decodes
@@ -658,6 +662,9 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             self.prefill_ratio_to_sas_metadata["prefill_input_positions"] = prefill_input_positions
             self.prefill_ratio_to_sas_metadata["prefill_query_start_loc"] = prefill_query_start_loc
 
+            prefill_query_start_loc_cpu = query_start_loc_cpu[reqs_start:] - query_start_loc_cpu[reqs_start]
+            self.prefill_ratio_to_sas_metadata["prefill_query_start_loc_cpu"] = prefill_query_start_loc_cpu
+
             cos, sin = get_cos_and_sin_dsa(prefill_input_positions)
             self.prefill_ratio_to_sas_metadata["cos"] = cos
             self.prefill_ratio_to_sas_metadata["sin"] = sin
@@ -672,6 +679,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             max_seq_lens = self.prefill_ratio_to_sas_metadata["max_seq_lens"]
             prefill_input_positions = self.prefill_ratio_to_sas_metadata["prefill_input_positions"]
             prefill_query_start_loc = self.prefill_ratio_to_sas_metadata["prefill_query_start_loc"]
+            prefill_query_start_loc_cpu = self.prefill_ratio_to_sas_metadata["prefill_query_start_loc_cpu"]
             cos = self.prefill_ratio_to_sas_metadata["cos"]
             sin = self.prefill_ratio_to_sas_metadata["sin"]
             prefill_seq_lens = self.prefill_ratio_to_sas_metadata["prefill_seq_lens"]
@@ -863,7 +871,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                     _sl_cpu = common_attn_metadata.seq_lens.cpu()
                 seq_lens_np = _sl_cpu[reqs_start : reqs_start + B].numpy()
                 layer_name_topm = self.layer_names[0]
-                actual_qlens = prefill_query_start_loc[1:] - prefill_query_start_loc[:-1]
+                actual_qlens = prefill_query_start_loc_cpu[1:] - prefill_query_start_loc_cpu[:-1]
 
                 topm_idxs_prefill, kvlens_key, max_seqlen_k, _has_cached, num_topm_blocks, chunk_start_logical, act_qlen = \
                     self._build_topm_subgroups_prefill(

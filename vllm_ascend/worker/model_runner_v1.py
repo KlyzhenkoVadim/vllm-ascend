@@ -3269,6 +3269,7 @@ class NPUModelRunner(GPUModelRunner):
                         decode_ratio_to_sas_metadata=dict(),
                         common_ratio_to_sas_metadata=dict(),
                         block_size=attn_group.kv_cache_spec.block_size,
+                        input_batch=None,
                         )
                 else:
                     extra_attn_metadata_args = dict(
@@ -3279,6 +3280,8 @@ class NPUModelRunner(GPUModelRunner):
                         common_ratio_to_sas_metadata=common_ratio_to_sas_metadata,
                         block_size=attn_group.kv_cache_spec.block_size,
                         )
+                    if "indexer.k_cache" in attn_group.layer_names[0]:
+                        extra_attn_metadata_args["input_batch"] = self.input_batch
 
             # add kvcomp_metadata into common_attn_metadata
             #NOTE - Build AscendDSAMetadata，用于DSA forward_decode/prefill
