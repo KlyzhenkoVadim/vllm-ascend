@@ -862,7 +862,6 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         if self.prefill_ratio_to_sas_metadata.get("qli") is None:
             kvlens_key = self.seq_lens[reqs_start:].clone()
             max_seqlen_k = self.seq_lens[reqs_start:].max().item()
-            self.prefill_ratio_to_sas_metadata["topm_idxs_prefill"]=topm_idxs_prefill
             kvlens_key = None
             _block_table = None
             max_seqlen_k = None
@@ -885,7 +884,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 layer_name = self.layer_names[0]
                 actual_qlens = prefill_query_start_loc_cpu[1:] - prefill_query_start_loc_cpu[:-1]
 
-                topm_idxs_prefill, kvlens_key, max_seqlen_k, _has_cached, num_topm_blocks, chunk_start_logical, act_qlen = \
+                topm_unique_logical, kvlens_key, max_seqlen_k, _has_cached, num_topm_blocks, chunk_start_logical, act_qlen = \
                     self._build_topm_subgroups_prefill(
                         input_batch=input_batch,
                         layer_name=layer_name,
@@ -894,14 +893,11 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                         actual_qlens=actual_qlens,
                         block_table=self.block_table[reqs_start:, ...],
                         index_topm=index_topm,
-                        index_topk=index_topk,
                         micro_step_num=micro_step_num,
                     )
 
-            topm_unique_logical = None
             topm_unique_phys = None
             if has_topm and num_topm_blocks > 0:
-                topm_unique_logical = torch.unique(topm_idxs_prefill.squeeze(0).squeeze(0) // 32)
                 topm_unique_phys = torch.gather(
                     self.block_table[reqs_start:, ...][:1], 1,
                     topm_unique_logical.unsqueeze(0)).squeeze(0)
@@ -930,7 +926,6 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             self.prefill_ratio_to_sas_metadata["kvlens_key"] = kvlens_key
             self.prefill_ratio_to_sas_metadata["max_seq_k"] = max_seq_lens
 
-            self.prefill_ratio_to_sas_metadata["topm_idxs_prefill"]=topm_idxs_prefill
             self.prefill_ratio_to_sas_metadata["kvlens_key"]=kvlens_key
             self.prefill_ratio_to_sas_metadata["_block_table"]=_block_table
             self.prefill_ratio_to_sas_metadata["max_seqlen_k"]=max_seqlen_k
@@ -943,7 +938,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         kvlens_key = self.prefill_ratio_to_sas_metadata["kvlens_key"]
         max_seq_lens = self.prefill_ratio_to_sas_metadata["max_seq_k"]
 
-        topm_idxs_prefill = self.prefill_ratio_to_sas_metadata["topm_idxs_prefill"]
+        topm_idxs_prefill = None
         kvlens_key = self.prefill_ratio_to_sas_metadata["kvlens_key"]
         _block_table = self.prefill_ratio_to_sas_metadata["_block_table"]
         max_seqlen_k = self.prefill_ratio_to_sas_metadata["max_seqlen_k"]
@@ -972,7 +967,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             qli_metadata=qli_metadata,
             cu_c4_cmp_seqlen_list=cu_c4_cmp_seqlen_list,
             cu_c128_cmp_seqlen_list=cu_c128_cmp_seqlen_list,
-            topm_idxs=topm_idxs_prefill,
+            topm_idxs=None,
             topm_num_blocks=num_topm_blocks,
             topm_chunk_start_logical=chunk_start_logical,
             act_qlen=act_qlen,
@@ -1499,21 +1494,19 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
 
     def _build_topm_subgroups_prefill(self, input_batch, layer_name, seq_lens_np,
                                        kvlens, actual_qlens, block_table,
-                                       index_topm, index_topk, micro_step_num):
+                                       index_topm, micro_step_num):
         """[PREFILL] Compute topm bookkeeping for prefill chunks.
 
         - Reads CPU state (input_batch.topm_state).
-        - If state has cached topm_idxs: computes composite kvlens, chunk info.
+        - If state has cached topm_blocks: computes composite kvlens, chunk info.
         - Does NOT modify block_table in-place.
-        Returns: topm_idxs, kvlens_key, max_seqlen_k, has_cached,
+        Returns: topm_unique_logical, kvlens_key, max_seqlen_k, has_cached,
                  num_topm_blocks, chunk_start_logical, act_qlen.
         """
         B = len(kvlens)
-        device = kvlens.device
         req_ids = input_batch.req_ids[:B]
         block_size = 32
 
-        topm_idxs = torch.zeros(B, 1, index_topm, dtype=torch.int32, device=device)
         actual_seq_lengths_key = kvlens.clone()
         max_seqlen_k = int(actual_seq_lengths_key.max().item())
         has_cached = False
@@ -1521,6 +1514,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         num_topm_blocks = 0
         chunk_start_logical = 0
         act_qlen_return = 0
+        topm_unique_logical = None
 
         for i, rid in enumerate(req_ids):
             if rid is None:
@@ -1540,13 +1534,10 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 state.start_cache = True
                 state.ustep = 0
 
-            if state.topm_idxs is not None:
+            if state.topm_blocks is not None:
                 has_cached = True
-                topm_idxs[i] = state.topm_idxs
-
-                topm_logical = state.topm_idxs // block_size
-                topm_unique_blocks = torch.unique(topm_logical)
-                num_topm_blocks = topm_unique_blocks.numel()
+                topm_unique_logical = state.topm_blocks
+                num_topm_blocks = topm_unique_logical.numel()
                 num_prev_blocks = cdiv(kvlen, block_size)
                 chunk_start_logical = num_prev_blocks - cdiv(act_qlen, block_size)
                 act_qlen_return = act_qlen
@@ -1557,7 +1548,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             state.ustep += 1
             max_seqlen_k = max(max_seqlen_k, int(actual_seq_lengths_key[i].item()))
 
-        return topm_idxs, actual_seq_lengths_key, max_seqlen_k, has_cached, num_topm_blocks, chunk_start_logical, act_qlen_return
+        return topm_unique_logical, actual_seq_lengths_key, max_seqlen_k, has_cached, num_topm_blocks, chunk_start_logical, act_qlen_return
 
 class AscendDSAImpl(DSAAttentionImpl):
     """

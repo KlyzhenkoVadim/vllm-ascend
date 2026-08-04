@@ -2318,13 +2318,13 @@ class NPUModelRunner(GPUModelRunner):
                 for layer_name, meta in attn_metadata.items():
                     prefill = getattr(meta, 'prefill', None)
                     if prefill is not None and prefill.topm_idxs is not None:
-                        last_token_topm = prefill.topm_idxs[-1].clone()
+                        topm_blocks = torch.unique(prefill.topm_idxs[-1] // 32)
                         for rid in self.input_batch.req_ids:
                             if rid is None:
                                 continue
                             layer_state = self.input_batch.topm_state.get(rid, {}).get(layer_name)
                             if layer_state is not None:
-                                layer_state.topm_idxs = last_token_topm.clone()
+                                layer_state.topm_blocks = topm_blocks.clone()
 
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None

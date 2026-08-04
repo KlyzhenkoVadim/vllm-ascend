@@ -36,7 +36,7 @@ from vllm_ascend.worker.block_table import MultiGroupBlockTable
 class TopMReqState:
     ustep: int = 0
     start_cache: bool = False
-    topm_idxs: Optional[torch.Tensor] = None
+    topm_blocks: Optional[torch.Tensor] = None
 
 
 class NPUInputBatch(InputBatch):
@@ -228,7 +228,7 @@ class NPUInputBatch(InputBatch):
         self.logitsprocs = logitsprocs or LogitsProcessors()
         self.logitsprocs_need_output_token_ids = logitsprocs_need_output_token_ids
 
-        # Per-request per-layer topM state (ustep, start_cache, topm_idxs).
+        # Per-request per-layer topM state (ustep, start_cache, topm_blocks).
         # Keyed by req_id -> layer_name -> TopMReqState.
         self.topm_state: dict[str, dict[str, TopMReqState]] = {}
 
