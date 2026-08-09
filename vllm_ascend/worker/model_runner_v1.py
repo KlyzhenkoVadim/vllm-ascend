@@ -158,7 +158,7 @@ from vllm_ascend.utils import (
     set_weight_prefetch_method,
     should_skip_allreduce_across_dp_group,
 )
-from vllm_ascend.worker.npu_input_batch import NPUInputBatch
+from vllm_ascend.worker.npu_input_batch import NPUInputBatch, TopMReqState
 from vllm_ascend.worker.pcp_utils import PCPManager
 from vllm_ascend.worker.utils import AscendKVBlockZeroer
 
@@ -2043,6 +2043,7 @@ class NPUModelRunner(GPUModelRunner):
                 deferred_state_corrections_fn = self._update_states(
                     scheduler_output
                 )
+                
 
                 if has_ec_transfer() and get_ec_transfer().is_producer:
                     with self.maybe_get_ec_connector_output(
@@ -2086,6 +2087,31 @@ class NPUModelRunner(GPUModelRunner):
                     return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
                 num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
                 max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
+                ###NOTE: Уже здесь всё есть для того, чтобы на цпу посчитать
+                # composite_bt, composite_indices и потом копировать с кайфом. 
+                block_table_ = self.input_batch.block_table.block_tables[0]
+                for i, req_id in enumerate(req_ids):
+                    state = self.input_batch.topm_state.get(req_id, None)
+                    if not state: # NOTE: btw we can create topm state here.
+                        continue
+                    #dict[layer_name, TopMState]
+                    #FIXME:
+                    block_table_cpu = block_table_.get_cpu_tensor()[i]
+                    num_prev_blocks = block_table_.num_blocks_per_row[i]
+                    num_chunk_blocks = num_scheduled_tokens_np[i] // self.block_size // 4 #TODO: Fix it!!!
+                    chunk_start_logical = num_prev_blocks - num_chunk_blocks
+                    chunk_phys = block_table_cpu[chunk_start_logical : num_prev_blocks] # 1D: (8192?)
+                    chunk_logical_indices = torch.arange(chunk_start_logical, num_prev_blocks, dtype=torch.int32, device="cpu")
+                    for _, state_ in state.items():
+                        topm_unique_logical = torch.unique(state_.topm_blocks_cpu) #non-unique? #//32?
+                        num_topm_blocks = topm_unique_logical.numel()
+                        topm_unique_phys = torch.gather(block_table_cpu, 0, topm_unique_logical)
+                        state_.composite_bt = torch.cat([topm_unique_phys,chunk_phys], dim=0).unsqueeze(0).pin_memory().to(self.device, non_blocking=True) # .to(device???)
+                        state_.composite_indices = torch.cat([topm_unique_logical, chunk_logical_indices], dim=0).pin_memory().to(self.device, non_blocking=True) # .to(device ???)
+                        state_.num_topm_blocks = num_topm_blocks
+                        # state_.composite_bt = composite_bt
+                        # state_.composite_index = composite_index
+
                 (
                     logits_indices,
                     spec_decode_metadata,
@@ -2313,6 +2339,26 @@ class NPUModelRunner(GPUModelRunner):
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
+            # Sync topM state for prefill
+            #TODO(KlyzhenkoVadim) When multi-batching - need to be resolved!!!
+            if not use_spec_decode and attn_metadata is not None:
+                for layer_name, meta in attn_metadata.items():
+                    prefill = getattr(meta, 'prefill', None)
+                    if prefill is not None and prefill.topm_idxs is not None:
+                        #FIXME: Trying to move it on CPU.
+                        #Because torch.unique kills perfomance.
+                        #I will make unique on build_prefill_metadata.
+                        #Then create composite_bt fully on cpu and finally async move!
+                        # topm_blocks = torch.unique(prefill.topm_idxs[-1] // 32)
+                        
+                        topm_blocks = (prefill.topm_idxs[-1] // self.block_size)
+                        for rid in self.input_batch.req_ids:
+                            if rid is None:
+                                continue
+                            layer_state = self.input_batch.topm_state.get(rid, {}).get(layer_name)
+                            if layer_state is not None:
+                                layer_state.topm_blocks_cpu = topm_blocks.to("cpu", non_blocking=True)
+
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs:
@@ -3228,11 +3274,16 @@ class NPUModelRunner(GPUModelRunner):
                     num_decode_draft_tokens_cpu=self.num_decode_draft_tokens.cpu[:num_reqs_padded],
                 )
 
+            #TODO(KlyzhenkoVadim): Have a check. It could be a problem...
+            # It's okay...
+            #attn_group.layer_names
+            #['model.layers.2.self_attn.indexer.k_cache']
             if isinstance(builder, (AscendDSAMetadataBuilder, AscendDSACPMetadataBuilder)):
                 compress_ratio = getattr(attn_group.kv_cache_spec, "compress_ratio", 1)
                 if for_cudagraph_capture:
                     extra_attn_metadata_args = dict(
                         compress_ratio=compress_ratio,
+                        # input_batch=self.input_batch, #TODO(KlyzhenkoVadim): Have a check!
                         prefill_ratio_to_sas_metadata=dict(),
                         decode_ratio_to_sas_metadata=dict(),
                         common_ratio_to_sas_metadata=dict(),
@@ -3241,12 +3292,15 @@ class NPUModelRunner(GPUModelRunner):
                 else:
                     extra_attn_metadata_args = dict(
                         compress_ratio=compress_ratio,
+                        # input_batch=self.input_batch,
                         num_reqs_actual=num_reqs_actual,
                         prefill_ratio_to_sas_metadata=prefill_ratio_to_sas_metadata,
                         decode_ratio_to_sas_metadata=decode_ratio_to_sas_metadata,
                         common_ratio_to_sas_metadata=common_ratio_to_sas_metadata,
                         block_size=attn_group.kv_cache_spec.block_size,
                         )
+                    if "indexer.k_cache" in attn_group.layer_names[0]:
+                        extra_attn_metadata_args["input_batch"] = self.input_batch
 
             # add kvcomp_metadata into common_attn_metadata
             if (for_cudagraph_capture
