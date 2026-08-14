@@ -882,7 +882,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 layer_name = self.layer_names[0] # 'model.layers.2.self_attn.indexer.k_cache'
                 actual_qlens = prefill_query_start_loc_cpu[1:] - prefill_query_start_loc_cpu[:-1] #8192
 
-                composite_bt, composite_kvlen, composite_index, has_cached, num_topm_blocks, act_qlen_return = \
+                composite_bt, composite_kvlen, composite_index, has_cached, num_topm_blocks = \
                     self._build_topm_subgroups_prefill(
                                             input_batch=input_batch,
                                             layer_name=layer_name,
@@ -953,6 +953,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             cu_c4_cmp_seqlen_list=cu_c4_cmp_seqlen_list,
             cu_c128_cmp_seqlen_list=cu_c128_cmp_seqlen_list,
             #For block-topm-prefill.
+            #these are need to rewrite for each layer!
             topm_num_blocks=num_topm_blocks,
             composite_index=composite_index,
             composite_kvlen=composite_kvlen,
@@ -1490,8 +1491,6 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
 
         has_cached = False
         num_topm_blocks = 0
-        act_qlen_return = 0
-        topm_unique_logical = None
 
         # Результаты по умолчанию
         composite_bt = block_table  # вернём как есть, если топМ нет
@@ -1532,7 +1531,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
 
             state.ustep += 1  # микрошаг для следующего раза
 
-        return composite_bt, composite_kvlen, composite_index, has_cached, num_topm_blocks, act_qlen_return
+        return composite_bt, composite_kvlen, composite_index, has_cached, num_topm_blocks
 
 class AscendDSAImpl(DSAAttentionImpl):
     """
