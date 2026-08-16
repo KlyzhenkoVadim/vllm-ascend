@@ -169,6 +169,7 @@ from vllm_ascend.ascend_forward_context import (  # isort: skip
     set_ascend_forward_context,
     set_mc2_mask,
     set_mc2_tokens_capacity,
+    ForwardTopMState
 )
 
 from vllm_ascend.sample.rejection_sampler import AscendRejectionSampler
@@ -2089,28 +2090,52 @@ class NPUModelRunner(GPUModelRunner):
                 max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
                 ###NOTE: Уже здесь всё есть для того, чтобы на цпу посчитать
                 # composite_bt, composite_indices и потом копировать с кайфом. 
-                block_table_ = self.input_batch.block_table.block_tables[0]
-                for i, req_id in enumerate(req_ids):
-                    state = self.input_batch.topm_state.get(req_id, None)
-                    if not state: # NOTE: btw we can create topm state here.
-                        continue
-                    #dict[layer_name, TopMState]
-                    #FIXME:
-                    block_table_cpu = block_table_.get_cpu_tensor()[i]
-                    num_prev_blocks = block_table_.num_blocks_per_row[i]
-                    num_chunk_blocks = num_scheduled_tokens_np[i] // self.block_size // 4 #TODO: Fix it!!!
-                    chunk_start_logical = num_prev_blocks - num_chunk_blocks
-                    chunk_phys = block_table_cpu[chunk_start_logical : num_prev_blocks] # 1D: (8192?)
-                    chunk_logical_indices = torch.arange(chunk_start_logical, num_prev_blocks, dtype=torch.int32, device="cpu")
-                    for _, state_ in state.items():
-                        topm_unique_logical = torch.unique(state_.topm_blocks_cpu) #non-unique? #//32?
+
+                #FIXME: I need to confirm that attn_group[0][0] always for indexer.
+                per_layer_topm_state = {}
+                layer_names = self.attn_groups[0][0].layer_names #FIXME:!!!!
+                block_table_ = self.input_batch.block_table.block_tables[0] # I forgot - why do we choose [0]
+                for layer_name in layer_names:
+                    states=[]
+                    composite_bt_list=[]
+                    composite_index_list=[]
+                    num_blocks_list = []
+                    t_state = per_layer_topm_state.setdefault(layer_name, ForwardTopMState())
+                    for i, req_id in enumerate(req_ids):
+                        # state = self.input_batch.topm_state.get(req_id)
+                        #short = kvlen < 4 * index_topm
+                        state = self.input_batch.topm_state.setdefault(req_id, {})
+                        if not state:
+                            continue
+                        # layer_topmstate = state.get(layer_name)
+                        #TODO(KlyzhenkoVadim): Refactor to the .setdefault(rid,{}).setdefault(layer_name, TopMReqState()) ...
+                        layer_topmstate = state.setdefault(layer_name, TopMReqState())
+                        assert layer_topmstate
+                        states.append(layer_topmstate)
+                        block_table_cpu = block_table_.get_cpu_tensor()[i]
+                        num_prev_blocks = block_table_.num_blocks_per_row[i]
+                        num_chunk_blocks = num_scheduled_tokens_np[i] // self.block_size // 4 #TODO: Fix it!!!
+                        chunk_start_logical = num_prev_blocks - num_chunk_blocks
+                        chunk_phys = block_table_cpu[chunk_start_logical : num_prev_blocks] # 1D: (8192?)
+                        chunk_logical_indices = torch.arange(chunk_start_logical, num_prev_blocks, dtype=torch.int32, device="cpu")
+                        
+                        topm_unique_logical = torch.unique(layer_topmstate.topm_blocks_cpu) #non-unique? #//32?
                         num_topm_blocks = topm_unique_logical.numel()
                         topm_unique_phys = torch.gather(block_table_cpu, 0, topm_unique_logical)
-                        state_.composite_bt = torch.cat([topm_unique_phys,chunk_phys], dim=0).unsqueeze(0).pin_memory().to(self.device, non_blocking=True) # .to(device???)
-                        state_.composite_indices = torch.cat([topm_unique_logical, chunk_logical_indices], dim=0).pin_memory().to(self.device, non_blocking=True) # .to(device ???)
-                        state_.num_topm_blocks = num_topm_blocks
-                        # state_.composite_bt = composite_bt
-                        # state_.composite_index = composite_index
+                        composite_bt_list.append(torch.cat([topm_unique_phys,chunk_phys], dim=0).unsqueeze(0)) # ? for each request bt and indices are different!
+                        composite_index_list.append(torch.cat([topm_unique_logical,chunk_logical_indices], dim=0)) # ?
+                    #forward_composite: 
+                    #  'model.layers.2.self_attn.indexer.k_cache': 
+                    #           |---composite_bt [B, num_composite_blocks_0]
+                    #           |---composite_indices [B, num_composite_blocks_0]
+                    #  'model.layers.4.self_attn.indexer.k_cache': 
+                    #           |---composite_bt [B, num_composite_blocks_1]
+                    #           |---composite_indices [B, num_composite_blocks_1]
+                    #
+                    if composite_bt_list:
+                        t_state.composite_bt = torch.cat(composite_bt_list, dim=0).pin_memory().to(self.device, non_blocking=True)
+                        t_state.composite_indices = torch.cat(composite_index_list, dim=0).pin_memory().to(self.device, non_blocking=True)
+                        t_state.num_topm_blocks = num_topm_blocks #TODO: FIXIT!
 
                 (
                     logits_indices,
@@ -2326,6 +2351,8 @@ class NPUModelRunner(GPUModelRunner):
                 has_sinks=self._has_sinks,
                 input_ids=input_ids,
                 eplb_heat_collection_status=self.eplb_heat_collection_status if self.dynamic_eplb else False,
+                # NOTE: pass current fwd context
+                per_layer_topm_state=per_layer_topm_state,
             ),
             self.maybe_get_kv_connector_output(
                 scheduler_output,
@@ -2341,23 +2368,26 @@ class NPUModelRunner(GPUModelRunner):
             )
             # Sync topM state for prefill
             #TODO(KlyzhenkoVadim) When multi-batching - need to be resolved!!!
-            if not use_spec_decode and attn_metadata is not None:
-                for layer_name, meta in attn_metadata.items():
-                    prefill = getattr(meta, 'prefill', None)
-                    if prefill is not None and prefill.topm_idxs is not None:
-                        #FIXME: Trying to move it on CPU.
-                        #Because torch.unique kills perfomance.
-                        #I will make unique on build_prefill_metadata.
-                        #Then create composite_bt fully on cpu and finally async move!
-                        # topm_blocks = torch.unique(prefill.topm_idxs[-1] // 32)
-                        
-                        topm_blocks = (prefill.topm_idxs[-1] // self.block_size)
-                        for rid in self.input_batch.req_ids:
-                            if rid is None:
-                                continue
-                            layer_state = self.input_batch.topm_state.get(rid, {}).get(layer_name)
-                            if layer_state is not None:
-                                layer_state.topm_blocks_cpu = topm_blocks.to("cpu", non_blocking=True)
+            if self.with_prefill: # TODO(KlyzhenkoVadim): Have a check whether it's updating?!
+            # if not use_spec_decode and per_layer_topm_state:
+                for layer_name, meta in per_layer_topm_state.items():
+                    # prefill = getattr(meta, 'prefill', None)
+                    # if prefill is not None and prefill.topm_idxs is not None:
+                    #FIXME: Trying to move it on CPU.
+                    #Because torch.unique kills perfomance.
+                    #I will make unique on build_prefill_metadata.
+                    #Then create composite_bt fully on cpu and finally async move!
+                    # topm_blocks = torch.unique(prefill.topm_idxs[-1] // 32)
+
+                    #TODO(KlyzhenkoVadim): This part need to be fixed fo multibatch
+                    topm_blocks = (meta.topm_idxs[-1] // self.block_size)
+                    for rid in self.input_batch.req_ids:
+                        if rid is None:
+                            continue
+                        layer_state = self.input_batch.topm_state.get(rid, {}).get(layer_name)
+                        #layer_state = self.input_batch.topm_state.setdefault(rid, {}).setdefault(layer_name, TopMReqState())
+                        if layer_state is not None:
+                            layer_state.topm_blocks_cpu = topm_blocks.to("cpu", non_blocking=True)
 
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None
@@ -3076,6 +3106,7 @@ class NPUModelRunner(GPUModelRunner):
         num_scheduled_tokens_np: np.ndarray | None = None,
         cascade_attn_prefix_lens: list[list[int]] | None = None,
         num_scheduled_tokens_compressed_list: list[np.ndarray] | None = None,
+        current_fwd_state: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None, # NOTE: this part is for TopM
     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
         """
         :return: tuple[attn_metadata, spec_decode_common_attn_metadata]

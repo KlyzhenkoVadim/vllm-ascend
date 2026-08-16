@@ -23,6 +23,14 @@ from vllm_ascend.utils import (
     speculative_enable_dispatch_gmm_combine_decode,
 )
 
+class ForwardTopMState:
+    """
+    Per-layer state for current req_ids batch.
+    """
+    num_topm_blocks: torch.Tensor | None = None#??? (num_reqs,)
+    composite_bt: torch.Tensor | None = None # (num_reqs, N) <-- N = (num_topm_blocks_i) + chunk_size
+    composite_indices: torch.Tensor | None = None # (num_reqs, N) --|
+    topm_idxs: torch.Tensor | None = None # (num_reqs, topM) TODO: layout could be different (num_reqs, 1, topM) ?
 
 class MoECommType(Enum):
     ALLGATHER = 0
@@ -72,6 +80,7 @@ def set_ascend_forward_context(
     has_sinks=False,
     input_ids=None,
     eplb_heat_collection_status: bool = False,
+    per_layer_topm_state: dict[str, ForwardTopMState] | None = None,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -85,6 +94,9 @@ def set_ascend_forward_context(
         "cudagraph_runtime_mode": aclgraph_runtime_mode,
         "batch_descriptor": batch_descriptor,
         "skip_compiled": skip_compiled,
+        # NOTE: pass current fwd context
+        # "per_layer_topm_state": per_layer_topm_state,
+        
     }
     with set_forward_context(**forward_context_kwargs):
         forward_context = get_forward_context()
@@ -177,6 +189,9 @@ def set_ascend_forward_context(
         forward_context.max_tokens_across_pcp = max_tokens_across_pcp
 
         forward_context.eplb_heat_collection_status = eplb_heat_collection_status
+
+        ### TODO(KlyzhenkoVadim) HAve a check TOPM
+        forward_context.per_layer_topm_state = per_layer_topm_state
 
         if num_tokens is not None:
             if num_actual_tokens is None:
