@@ -169,6 +169,7 @@ from vllm_ascend.ascend_forward_context import (  # isort: skip
     set_ascend_forward_context,
     set_mc2_mask,
     set_mc2_tokens_capacity,
+    ForwardTopMState
 )
 
 from vllm_ascend.sample.rejection_sampler import AscendRejectionSampler
@@ -2087,30 +2088,164 @@ class NPUModelRunner(GPUModelRunner):
                     return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
                 num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
                 max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
-                ###NOTE: Уже здесь всё есть для того, чтобы на цпу посчитать
-                # composite_bt, composite_indices и потом копировать с кайфом. 
-                block_table_ = self.input_batch.block_table.block_tables[0]
-                for i, req_id in enumerate(req_ids):
-                    state = self.input_batch.topm_state.get(req_id, None)
-                    if not state: # NOTE: btw we can create topm state here.
-                        continue
-                    #dict[layer_name, TopMState]
-                    #FIXME:
-                    block_table_cpu = block_table_.get_cpu_tensor()[i]
-                    num_prev_blocks = block_table_.num_blocks_per_row[i]
-                    num_chunk_blocks = num_scheduled_tokens_np[i] // self.block_size // 4 #TODO: Fix it!!!
-                    chunk_start_logical = num_prev_blocks - num_chunk_blocks
-                    chunk_phys = block_table_cpu[chunk_start_logical : num_prev_blocks] # 1D: (8192?)
-                    chunk_logical_indices = torch.arange(chunk_start_logical, num_prev_blocks, dtype=torch.int32, device="cpu")
-                    for _, state_ in state.items():
-                        topm_unique_logical = torch.unique(state_.topm_blocks_cpu) #non-unique? #//32?
-                        num_topm_blocks = topm_unique_logical.numel()
-                        topm_unique_phys = torch.gather(block_table_cpu, 0, topm_unique_logical)
-                        state_.composite_bt = torch.cat([topm_unique_phys,chunk_phys], dim=0).unsqueeze(0).pin_memory().to(self.device, non_blocking=True) # .to(device???)
-                        state_.composite_indices = torch.cat([topm_unique_logical, chunk_logical_indices], dim=0).pin_memory().to(self.device, non_blocking=True) # .to(device ???)
-                        state_.num_topm_blocks = num_topm_blocks
-                        # state_.composite_bt = composite_bt
-                        # state_.composite_index = composite_index
+                # NOTE(KlyzhenkoVadim): All CPU-side composite bookkeeping for
+                # the block-topm prefill lives here. It must run only on
+                # prefill steps (decode uses the full-KV QLI path and does not
+                # need per_layer_topm_state). self.with_prefill is computed
+                # inside _prepare_inputs(), i.e. after this block, so we use a
+                # cheap proxy: a step is a prefill step iff at least one
+                # request schedules more than one token.
+                per_layer_topm_state = {}
+                local_k_cache_config = self.vllm_config.additional_config.get("local_k_cache_config", None)
+                has_prefill_step = bool(np.any(num_scheduled_tokens_np > 1)) # TODO(KlyzhenkoVadim): Maybe i just use ATTENTION_STATE???
+                # Batch slots (indices into input_batch.req_ids) that are
+                # prefill requests. vLLM v1 lays decode requests into the
+                # leading slots and prefill requests into the trailing slots,
+                # but resolving them by scheduled-token count is robust to any
+                # ordering. The QLI prefill metadata is built over exactly
+                # this subset (batch_size == num prefill requests), so the
+                # composite rows must be produced in the same order.
+                prefill_req_indices = np.nonzero(num_scheduled_tokens_np > 1)[0]
+                if local_k_cache_config is not None and has_prefill_step:
+                    # Find the KV cache group that owns the DSA indexer k_cache.
+                    # Relying on attn_groups[0][0] / block_tables[0] ordering is
+                    # fragile, so resolve the group by layer name instead.
+                    kv_cache_groups = self.kv_cache_config.kv_cache_groups
+                    #TODO(KlyzhenkoVadim): Move it into the initialization!
+                    indexer_gid = next(
+                        (
+                            gid
+                            for gid, group in enumerate(kv_cache_groups)
+                            if any("indexer.k_cache" in ln for ln in group.layer_names)
+                        ),
+                        None,
+                    )
+                    if indexer_gid is not None:
+                        # layer_names = kv_cache_groups[indexer_gid].layer_names
+                        layer_names = self.attn_groups[0][0].layer_names
+                        block_table_ = self.input_batch.block_table.block_tables[indexer_gid]
+                        block_table_cpu_all = block_table_.get_cpu_tensor()
+                        num_blocks_per_row = block_table_.num_blocks_per_row
+                        # Layer-independent per-request data, computed once per
+                        # prefill step and reused across every indexer layer.
+                        # Everything here depends only on the block table and the
+                        # scheduled token counts, never on layer_name, so
+                        # recomputing it inside the layer loop is pure overhead.
+                        precomputed = []
+                        for batch_idx in prefill_req_indices:
+                            req_id = req_ids[batch_idx]
+                            if req_id is None:
+                                precomputed.append(None)
+                                continue
+                            block_table_cpu = block_table_cpu_all[batch_idx]
+                            num_prev_blocks = num_blocks_per_row[batch_idx]
+                            num_chunk_blocks = num_scheduled_tokens_np[batch_idx] // self.block_size // 4
+                            chunk_start_logical = num_prev_blocks - num_chunk_blocks
+                            chunk_phys = block_table_cpu[chunk_start_logical:num_prev_blocks]
+                            chunk_logical_indices = torch.arange(
+                                chunk_start_logical, num_prev_blocks, dtype=torch.int32, device="cpu"
+                            )
+                            # No cached topM: full KV cache is the composite
+                            # (identity remap). Identical for every layer.
+                            identity_bt = block_table_cpu[:num_prev_blocks]
+                            identity_indices = torch.arange(num_prev_blocks, dtype=torch.int32, device="cpu")
+                            identity_kvlen = (
+                                self.input_batch.num_computed_tokens_cpu[batch_idx]
+                                + num_scheduled_tokens_np[batch_idx]
+                            )
+                            precomputed.append(
+                                (
+                                    req_id,
+                                    block_table_cpu,
+                                    num_chunk_blocks,
+                                    chunk_phys,
+                                    chunk_logical_indices,
+                                    identity_bt,
+                                    identity_indices,
+                                    identity_kvlen,
+                                )
+                            )
+                        for layer_name in layer_names:
+                            composite_bt_list = []
+                            composite_index_list = []
+                            composite_kvlen_list = []
+                            max_composite_blocks = 0
+                            for batch_idx, pc in zip(prefill_req_indices, precomputed):
+                                if pc is None:
+                                    continue
+                                (
+                                    req_id,
+                                    block_table_cpu,
+                                    num_chunk_blocks,
+                                    chunk_phys,
+                                    chunk_logical_indices,
+                                    identity_bt,
+                                    identity_indices,
+                                    identity_kvlen,
+                                ) = pc
+                                layer_state = self.input_batch.topm_state.get(req_id, {}).get(layer_name)
+                                # The QLI kernel leaves unfilled positions as
+                                # -1; drop them before turning indices into
+                                # blocks, otherwise -1 // 32 == -1 would poison
+                                # the unique()/gather() bookkeeping below.
+                                topm_blocks_cpu = (
+                                    layer_state.topm_blocks_cpu
+                                    if layer_state is not None and layer_state.topm_blocks_cpu is not None
+                                    else None
+                                )
+                                valid_topm_blocks = (
+                                    topm_blocks_cpu[topm_blocks_cpu >= 0] if topm_blocks_cpu is not None else None
+                                )
+                                has_topm = valid_topm_blocks is not None and valid_topm_blocks.numel() > 0
+                                if has_topm:
+                                    # topM blocks from previous prefill steps +
+                                    # the current chunk: the local K-cache.
+                                    topm_unique_logical = torch.unique(valid_topm_blocks)
+                                    num_topm_blocks = topm_unique_logical.numel()
+                                    topm_unique_phys = torch.gather(block_table_cpu, 0, topm_unique_logical)
+                                    composite_bt = torch.cat([topm_unique_phys, chunk_phys], dim=0)
+                                    composite_index = torch.cat([topm_unique_logical, chunk_logical_indices], dim=0)
+                                    # RAW (pre-compression) length: the QLI
+                                    # kernel divides actual_seq_lengths_key by
+                                    # cmp_ratio=4 internally.
+                                    composite_kvlen = (num_topm_blocks + num_chunk_blocks) * self.block_size * 4
+                                else:
+                                    # No cached topM: full KV cache is the
+                                    # composite (identity remap).
+                                    composite_bt = identity_bt
+                                    composite_index = identity_indices
+                                    composite_kvlen = identity_kvlen
+                                composite_bt_list.append(composite_bt)
+                                composite_index_list.append(composite_index)
+                                composite_kvlen_list.append(composite_kvlen)
+                                max_composite_blocks = max(max_composite_blocks, composite_bt.numel())
+                            if not composite_bt_list:
+                                continue
+                            # Pad every request row to max_composite_blocks.
+                            # The QLI kernel bounds its search per-request by
+                            # composite_kvlen, so padded slots are never read.
+                            # Repeat the last valid block to keep pad entries
+                            # in-bounds even if a kernel over-reads.
+                            num_reqs_padded = len(composite_bt_list)
+                            composite_bt = torch.zeros(
+                                (num_reqs_padded, max_composite_blocks), dtype=torch.int32, device="cpu"
+                            )
+                            composite_indices = torch.zeros(
+                                (num_reqs_padded, max_composite_blocks), dtype=torch.int32, device="cpu"
+                            )
+                            for row, (bt, idx) in enumerate(zip(composite_bt_list, composite_index_list)):
+                                num_blocks = bt.numel()
+                                if num_blocks < max_composite_blocks:
+                                    bt = torch.cat([bt, bt[-1:].expand(max_composite_blocks - num_blocks)], dim=0)
+                                    idx = torch.cat([idx, idx[-1:].expand(max_composite_blocks - num_blocks)], dim=0)
+                                composite_bt[row] = bt
+                                composite_indices[row] = idx
+                            t_state = per_layer_topm_state.setdefault(layer_name, ForwardTopMState())
+                            t_state.composite_bt = composite_bt.pin_memory().to(self.device, non_blocking=True)
+                            t_state.composite_indices = composite_indices.pin_memory().to(self.device, non_blocking=True)
+                            t_state.composite_kvlen = torch.tensor(
+                                composite_kvlen_list, dtype=torch.int32, device="cpu"
+                            ).pin_memory().to(self.device, non_blocking=True)
 
                 (
                     logits_indices,
@@ -2326,6 +2461,8 @@ class NPUModelRunner(GPUModelRunner):
                 has_sinks=self._has_sinks,
                 input_ids=input_ids,
                 eplb_heat_collection_status=self.eplb_heat_collection_status if self.dynamic_eplb else False,
+                # NOTE: pass current fwd context
+                per_layer_topm_state=per_layer_topm_state,
             ),
             self.maybe_get_kv_connector_output(
                 scheduler_output,
@@ -2339,25 +2476,54 @@ class NPUModelRunner(GPUModelRunner):
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
-            # Sync topM state for prefill
-            #TODO(KlyzhenkoVadim) When multi-batching - need to be resolved!!!
-            if not use_spec_decode and attn_metadata is not None:
-                for layer_name, meta in attn_metadata.items():
-                    prefill = getattr(meta, 'prefill', None)
-                    if prefill is not None and prefill.topm_idxs is not None:
-                        #FIXME: Trying to move it on CPU.
-                        #Because torch.unique kills perfomance.
-                        #I will make unique on build_prefill_metadata.
-                        #Then create composite_bt fully on cpu and finally async move!
-                        # topm_blocks = torch.unique(prefill.topm_idxs[-1] // 32)
-                        
-                        topm_blocks = (prefill.topm_idxs[-1] // self.block_size)
-                        for rid in self.input_batch.req_ids:
+            # Sync topM state for prefill (per-request: the last query token of
+            # every request). topm_idxs is in global c4 token space after the
+            # composite remap, so blocks are topm_idxs // block_size.
+            # meta.last_token_indices holds one entry per prefill request and
+            # is ordered identically to prefill_req_indices, so we map each
+            # row back to its batch slot via that same index array. This makes
+            # mixed prefill+decode batches align correctly.
+            if self.with_prefill and per_layer_topm_state:
+                # Collect every layer's [B, M] topM block tensor first and copy
+                # them to CPU with a single blocking copy. A device->host copy
+                # is a synchronization point: the previous per-layer loop forced
+                # one sync per indexer layer (one per transformer layer),
+                # serializing the tail of the forward. Stacking collapses that
+                # to a single sync.
+                topm_layers = []
+                topm_blocks_dev = []
+                for layer_name, meta in per_layer_topm_state.items():
+                    if meta.topm_idxs is None or meta.last_token_indices is None:
+                        continue
+                    num_topm_reqs = meta.last_token_indices.numel()
+                    if num_topm_reqs != prefill_req_indices.shape[0]:
+                        # Defensive guard: the QLI batch and the composite rows
+                        # must cover exactly the same prefill requests.
+                        continue
+                    per_req_topm = meta.topm_idxs[meta.last_token_indices]  # [B, 1, M]
+                    per_req_blocks = per_req_topm.squeeze(1) // self.block_size  # [B, M]
+                    topm_layers.append(layer_name)
+                    topm_blocks_dev.append(per_req_blocks)
+                if topm_blocks_dev:
+                    # NOTE: blocking copy. topm_blocks_cpu is consumed by the
+                    # NEXT prefill step's composite building (which runs on
+                    # CPU). A non_blocking copy may still be in flight when
+                    # that step reads it, producing stale/garbage block
+                    # indices (observed as out-of-bounds gather indices).
+                    #TODO(KlyzhenkoVadim): Have a check whether it'll really occur.
+                    topm_blocks_cpu_all = torch.stack(topm_blocks_dev, dim=0).to("cpu", non_blocking=True)  # [L, B, M]
+                    for layer_idx, layer_name in enumerate(topm_layers):
+                        per_req_blocks_cpu = topm_blocks_cpu_all[layer_idx]
+                        for row, batch_idx in enumerate(prefill_req_indices):
+                            rid = self.input_batch.req_ids[batch_idx]
                             if rid is None:
                                 continue
-                            layer_state = self.input_batch.topm_state.get(rid, {}).get(layer_name)
-                            if layer_state is not None:
-                                layer_state.topm_blocks_cpu = topm_blocks.to("cpu", non_blocking=True)
+                            # Create the per-layer state on the first prefill step
+                            # so that the next chunk can use the cached topM blocks.
+                            layer_state = self.input_batch.topm_state.setdefault(rid, {}).setdefault(
+                                layer_name, TopMReqState()
+                            )
+                            layer_state.topm_blocks_cpu = per_req_blocks_cpu[row]
 
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None
@@ -2437,7 +2603,7 @@ class NPUModelRunner(GPUModelRunner):
         # previous model forward without breaking async scheduling.
         if deferred_state_corrections_fn:
             deferred_state_corrections_fn()
-        return None
+        return None 
 
     @torch.inference_mode()
     def sample_tokens(
@@ -3076,6 +3242,7 @@ class NPUModelRunner(GPUModelRunner):
         num_scheduled_tokens_np: np.ndarray | None = None,
         cascade_attn_prefix_lens: list[list[int]] | None = None,
         num_scheduled_tokens_compressed_list: list[np.ndarray] | None = None,
+        current_fwd_state: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None, # NOTE: this part is for TopM
     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
         """
         :return: tuple[attn_metadata, spec_decode_common_attn_metadata]

@@ -36,11 +36,12 @@ from vllm_ascend.worker.block_table import MultiGroupBlockTable
 class TopMReqState:
     ustep: int = 0
     start_cache: bool = False
+    # topm_blocks_cpu: logical block indices (c4 space) selected by the last
+    # prefill step for this request/layer. Used to build the composite block
+    # table for the next prefill chunk. Kept on CPU because the composite
+    # assembly happens on the CPU side.
     topm_blocks: Optional[torch.Tensor] = None
     topm_blocks_cpu: Optional[torch.Tensor] = None
-    composite_bt: Optional[torch.Tensor] = None
-    composite_indices: Optional[torch.Tensor] = None
-    num_topm_blocks: int = 0
 
 
 class NPUInputBatch(InputBatch):

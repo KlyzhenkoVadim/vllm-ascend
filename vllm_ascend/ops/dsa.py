@@ -193,6 +193,12 @@ def dsa_forward(
     self = forward_context.no_compile_layers[layer_name]
     if forward_context.attn_metadata:
         attn_metadata = filter_metadata(forward_context.attn_metadata, self.prefix)
+        # NOTE: per_layer_topm_state is only populated on prefill steps when
+        # local_k_cache_config is enabled. On decode steps (or without the
+        # config) it is None/empty and the DSA impl falls back to the
+        # full-KV path.
+        topm_state = filter_metadata(forward_context.per_layer_topm_state or {}, self.prefix)
+        topm_state = topm_state[0] if topm_state else None
     else:
         attn_metadata = forward_context.attn_metadata
 
@@ -203,7 +209,7 @@ def dsa_forward(
     kv_cache = _build_kv_cache(self, forward_context)
 
     self.dsa_attn.impl.forward(
-        self.dsa_attn.layer_name, hidden_states, kv_cache, attn_metadata, need_gather_q_kv, output
+        self.dsa_attn.layer_name, hidden_states, kv_cache, attn_metadata, need_gather_q_kv, output, topm_state
     )
     return
 
